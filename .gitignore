@@ -1,0 +1,36 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated output
+output/
+results/
+*.pcapng
+output.pcap
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ML
+*.pkl
+*.joblib
+
+# Secrets
+.env
