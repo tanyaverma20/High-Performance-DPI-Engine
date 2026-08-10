@@ -278,24 +278,38 @@ bool QUICSNIExtractor::isQUICInitial(const uint8_t* payload, size_t length) {
 }
 
 std::optional<std::string> QUICSNIExtractor::extract(const uint8_t* payload, size_t length) {
-    // QUIC Initial packets contain the TLS Client Hello inside CRYPTO frames
-    // This is complex to parse properly due to QUIC framing
-    // For now, we'll do a simplified search for the SNI extension pattern
-    
+    // -----------------------------------------------------------------------
+    // STUB — Simplified QUIC SNI extraction
+    //
+    // A correct implementation must parse the QUIC Long Header, then locate
+    // and decrypt/process the CRYPTO frame payload to find the embedded TLS
+    // ClientHello.  That is deferred to Phase 2.
+    //
+    // This stub performs a heuristic scan for the TLS handshake type byte
+    // (0x01 = ClientHello) and then attempts to parse a TLS record starting
+    // 5 bytes before that position (as a TLS record header would precede it).
+    // -----------------------------------------------------------------------
+
     if (!isQUICInitial(payload, length)) {
         return std::nullopt;
     }
-    
-    // Search for TLS Client Hello pattern within the QUIC packet
-    // Look for the handshake type byte followed by SNI extension
-    for (size_t i = 0; i + 50 < length; i++) {
-        if (payload[i] == 0x01) {  // Client Hello handshake type
-            // Try to extract SNI starting from here
-            auto result = SNIExtractor::extract(payload + i - 5, length - i + 5);
+
+    // Fix (D5): the original loop started at i=0, so when i < 5 the expression
+    // payload + i - 5 produced a pointer BEFORE the buffer — out-of-bounds UB.
+    //
+    // Fix: start at i=5 so that (payload + i - 5) == payload at minimum.
+    // Also guard the sub-buffer length to never exceed what is available.
+    constexpr size_t MIN_TLS_LOOKAHEAD = 50;
+    for (size_t i = 5; i < length && (length - i) >= MIN_TLS_LOOKAHEAD; i++) {
+        if (payload[i] == 0x01) {  // TLS Handshake type: ClientHello
+            // Safe: i >= 5, so payload + i - 5 >= payload
+            const uint8_t* sub = payload + i - 5;
+            size_t sub_len     = length - (i - 5);  // bytes remaining from sub
+            auto result = SNIExtractor::extract(sub, sub_len);
             if (result) return result;
         }
     }
-    
+
     return std::nullopt;
 }
 

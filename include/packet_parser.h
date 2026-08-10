@@ -65,11 +65,13 @@ struct ParsedPacket {
     
     // IP layer (if present)
     bool has_ip = false;
-    uint8_t ip_version;
-    std::string src_ip;
+    uint8_t ip_version = 0;
+    std::string src_ip;    // Human-readable dotted-decimal (for display)
     std::string dest_ip;
-    uint8_t protocol;          // TCP=6, UDP=17, ICMP=1
-    uint8_t ttl;
+    uint32_t src_ip_raw  = 0;  // Native uint32 (same memcpy byte order from wire)
+    uint32_t dst_ip_raw  = 0;  // Avoids string round-trip in createPacketJob
+    uint8_t protocol     = 0;  // TCP=6, UDP=17, ICMP=1
+    uint8_t ttl          = 0;
     
     // Transport layer (if present)
     bool has_tcp = false;

@@ -1,4 +1,5 @@
 #include "dpi_engine.h"
+#include "net_utils.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -222,64 +223,50 @@ PacketJob DPIEngine::createPacketJob(const PacketAnalyzer::RawPacket& raw,
                                       uint32_t packet_id) {
     PacketJob job;
     job.packet_id = packet_id;
-    job.ts_sec = raw.header.ts_sec;
-    job.ts_usec = raw.header.ts_usec;
-    
-    // Set five-tuple - parse IP addresses from string back to uint32
-    auto parseIP = [](const std::string& ip) -> uint32_t {
-        uint32_t result = 0;
-        int octet = 0;
-        int shift = 0;
-        for (char c : ip) {
-            if (c == '.') {
-                result |= (octet << shift);
-                shift += 8;
-                octet = 0;
-            } else if (c >= '0' && c <= '9') {
-                octet = octet * 10 + (c - '0');
-            }
-        }
-        result |= (octet << shift);
-        return result;
-    };
-    
-    job.tuple.src_ip = parseIP(parsed.src_ip);
-    job.tuple.dst_ip = parseIP(parsed.dest_ip);
+    job.ts_sec    = raw.header.ts_sec;
+    job.ts_usec   = raw.header.ts_usec;
+
+    // Fix (F4): use src_ip_raw / dst_ip_raw directly from the parser.
+    // Previously the parser converted uint32→string, then this function
+    // converted string→uint32 again via a duplicated parseIP lambda.
+    job.tuple.src_ip   = parsed.src_ip_raw;
+    job.tuple.dst_ip   = parsed.dst_ip_raw;
     job.tuple.src_port = parsed.src_port;
     job.tuple.dst_port = parsed.dest_port;
     job.tuple.protocol = parsed.protocol;
-    
+
     // TCP flags
     job.tcp_flags = parsed.tcp_flags;
-    
+
     // Copy packet data
     job.data = raw.data;
-    
+
     // Calculate offsets
     job.eth_offset = 0;
-    job.ip_offset = 14;  // Ethernet header is 14 bytes
-    
+    job.ip_offset  = 14;  // Ethernet header is 14 bytes
+
     // IP header length
     if (job.data.size() > 14) {
-        uint8_t ip_ihl = job.data[14] & 0x0F;
+        uint8_t ip_ihl       = job.data[14] & 0x0F;
         size_t ip_header_len = ip_ihl * 4;
         job.transport_offset = 14 + ip_header_len;
-        
+
         // Transport header length
         if (parsed.has_tcp && job.data.size() > job.transport_offset) {
             uint8_t tcp_data_offset = (job.data[job.transport_offset + 12] >> 4) & 0x0F;
-            size_t tcp_header_len = tcp_data_offset * 4;
-            job.payload_offset = job.transport_offset + tcp_header_len;
+            size_t tcp_header_len   = tcp_data_offset * 4;
+            job.payload_offset      = job.transport_offset + tcp_header_len;
         } else if (parsed.has_udp) {
             job.payload_offset = job.transport_offset + 8;  // UDP header is 8 bytes
         }
-        
+
         if (job.payload_offset < job.data.size()) {
             job.payload_length = job.data.size() - job.payload_offset;
-            job.payload_data = job.data.data() + job.payload_offset;
+            // Note: payload_data raw pointer has been removed (D9 fix).
+            // Use job.getPayload() wherever the payload pointer is needed.
         }
     }
-    
+
     return job;
 }
 

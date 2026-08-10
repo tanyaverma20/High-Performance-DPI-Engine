@@ -8,8 +8,8 @@ namespace DPI {
 
 std::string FiveTuple::toString() const {
     std::ostringstream ss;
-    
-    // Format IP addresses
+
+    // Format IP addresses (same byte order as stored)
     auto formatIP = [](uint32_t ip) {
         std::ostringstream s;
         s << ((ip >> 0) & 0xFF) << "."
@@ -18,12 +18,12 @@ std::string FiveTuple::toString() const {
           << ((ip >> 24) & 0xFF);
         return s.str();
     };
-    
+
     ss << formatIP(src_ip) << ":" << src_port
        << " -> "
        << formatIP(dst_ip) << ":" << dst_port
        << " (" << (protocol == 6 ? "TCP" : protocol == 17 ? "UDP" : "?") << ")";
-    
+
     return ss.str();
 }
 
@@ -56,140 +56,226 @@ std::string appTypeToString(AppType type) {
     }
 }
 
-// Map SNI/domain to application type
+// ============================================================================
+// Domain matching helpers
+// ============================================================================
+
+// Lowercase a string once, removing a trailing dot if present (FQDN form).
+// Empty input returns empty string — no UB.
+static std::string normalizeDomain(const std::string& s) {
+    if (s.empty()) return {};
+
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+
+    // Strip trailing dot (FQDN notation: "example.com." → "example.com")
+    if (!out.empty() && out.back() == '.') {
+        out.pop_back();
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// isDomainOrSubdomain(host, apex)
+//
+// Returns true iff `host` is exactly `apex` OR is a valid subdomain of `apex`.
+//
+// A valid subdomain must have a dot boundary directly before the apex suffix:
+//   host == "example.com"          apex == "example.com"  → true  (exact)
+//   host == "www.example.com"      apex == "example.com"  → true  (subdomain)
+//   host == "api.v2.example.com"   apex == "example.com"  → true  (deep subdomain)
+//   host == "notexample.com"       apex == "example.com"  → false (different TLD)
+//   host == "prefixexample.com"    apex == "example.com"  → false (no dot boundary)
+//
+// Both `host` and `apex` must already be lowercase and without trailing dots.
+// ---------------------------------------------------------------------------
+static bool isDomainOrSubdomain(const std::string& host, const std::string& apex) {
+    if (host.empty() || apex.empty()) return false;
+
+    // Exact match
+    if (host == apex) return true;
+
+    // Subdomain: host must end with "." + apex
+    if (host.size() <= apex.size()) return false;  // host too short to be subdomain
+
+    size_t dot_pos = host.size() - apex.size() - 1;
+    return host[dot_pos] == '.' &&
+           host.compare(dot_pos + 1, apex.size(), apex) == 0;
+}
+
+// ============================================================================
+// sniToAppType — Map SNI/domain to application type
+//
+// Fix (D1): The original implementation used std::string::find() for all
+// checks, which performs unanchored substring matching.  This caused e.g.
+// "netflix.com" to be classified as Twitter/X (because it contains the
+// substring "x.com") and allowed spoofed hostnames like
+// "amazonsupport.evil.com" to be classified as Amazon.
+//
+// This implementation uses isDomainOrSubdomain() which requires a dot-label
+// boundary, preventing all such false positives.
+// ============================================================================
 AppType sniToAppType(const std::string& sni) {
     if (sni.empty()) return AppType::UNKNOWN;
-    
-    // Convert to lowercase for matching
-    std::string lower_sni = sni;
-    std::transform(lower_sni.begin(), lower_sni.end(), lower_sni.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    
-    // Check for known patterns
-    // Google (including YouTube, which is owned by Google)
-    if (lower_sni.find("google") != std::string::npos ||
-        lower_sni.find("gstatic") != std::string::npos ||
-        lower_sni.find("googleapis") != std::string::npos ||
-        lower_sni.find("ggpht") != std::string::npos ||
-        lower_sni.find("gvt1") != std::string::npos) {
-        return AppType::GOOGLE;
-    }
-    
-    // YouTube
-    if (lower_sni.find("youtube") != std::string::npos ||
-        lower_sni.find("ytimg") != std::string::npos ||
-        lower_sni.find("youtu.be") != std::string::npos ||
-        lower_sni.find("yt3.ggpht") != std::string::npos) {
+
+    // Normalize once — lowercase + strip trailing dot
+    const std::string h = normalizeDomain(sni);
+    if (h.empty()) return AppType::UNKNOWN;
+
+    // -----------------------------------------------------------------------
+    // Order matters: more specific checks first to avoid shadow effects.
+    // (e.g. YouTube before Google, Instagram/WhatsApp before Facebook)
+    // -----------------------------------------------------------------------
+
+    // YouTube (check before Google — youtube.com is not google.com)
+    if (isDomainOrSubdomain(h, "youtube.com") ||
+        isDomainOrSubdomain(h, "ytimg.com")   ||
+        isDomainOrSubdomain(h, "youtu.be")    ||
+        isDomainOrSubdomain(h, "yt3.ggpht.com")) {
         return AppType::YOUTUBE;
     }
-    
-    // Facebook/Meta
-    if (lower_sni.find("facebook") != std::string::npos ||
-        lower_sni.find("fbcdn") != std::string::npos ||
-        lower_sni.find("fb.com") != std::string::npos ||
-        lower_sni.find("fbsbx") != std::string::npos ||
-        lower_sni.find("meta.com") != std::string::npos) {
-        return AppType::FACEBOOK;
-    }
-    
-    // Instagram (owned by Meta)
-    if (lower_sni.find("instagram") != std::string::npos ||
-        lower_sni.find("cdninstagram") != std::string::npos) {
+
+    // Instagram (check before Facebook)
+    if (isDomainOrSubdomain(h, "instagram.com") ||
+        isDomainOrSubdomain(h, "cdninstagram.com")) {
         return AppType::INSTAGRAM;
     }
-    
-    // WhatsApp (owned by Meta)
-    if (lower_sni.find("whatsapp") != std::string::npos ||
-        lower_sni.find("wa.me") != std::string::npos) {
+
+    // WhatsApp (check before Facebook)
+    if (isDomainOrSubdomain(h, "whatsapp.com") ||
+        isDomainOrSubdomain(h, "whatsapp.net") ||
+        isDomainOrSubdomain(h, "wa.me")) {
         return AppType::WHATSAPP;
     }
-    
-    // Twitter/X
-    if (lower_sni.find("twitter") != std::string::npos ||
-        lower_sni.find("twimg") != std::string::npos ||
-        lower_sni.find("x.com") != std::string::npos ||
-        lower_sni.find("t.co") != std::string::npos) {
+
+    // Facebook / Meta
+    if (isDomainOrSubdomain(h, "facebook.com") ||
+        isDomainOrSubdomain(h, "fbcdn.net")    ||
+        isDomainOrSubdomain(h, "fb.com")       ||
+        isDomainOrSubdomain(h, "fbsbx.com")    ||
+        isDomainOrSubdomain(h, "meta.com")) {
+        return AppType::FACEBOOK;
+    }
+
+    // Google (broad — after YouTube, Instagram, WhatsApp, Facebook)
+    if (isDomainOrSubdomain(h, "google.com")      ||
+        isDomainOrSubdomain(h, "googleapis.com")  ||
+        isDomainOrSubdomain(h, "gstatic.com")     ||
+        isDomainOrSubdomain(h, "ggpht.com")       ||
+        isDomainOrSubdomain(h, "gvt1.com")        ||
+        isDomainOrSubdomain(h, "googleusercontent.com")) {
+        return AppType::GOOGLE;
+    }
+
+    // Twitter / X
+    // NOTE: "x.com" must be matched as a full domain apex, not substring.
+    // Previously `find("x.com")` matched "netflix.com" — this is now fixed.
+    if (isDomainOrSubdomain(h, "twitter.com") ||
+        isDomainOrSubdomain(h, "twimg.com")   ||
+        isDomainOrSubdomain(h, "x.com")       ||
+        isDomainOrSubdomain(h, "t.co")) {
         return AppType::TWITTER;
     }
-    
+
     // Netflix
-    if (lower_sni.find("netflix") != std::string::npos ||
-        lower_sni.find("nflxvideo") != std::string::npos ||
-        lower_sni.find("nflximg") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "netflix.com")  ||
+        isDomainOrSubdomain(h, "nflxvideo.net") ||
+        isDomainOrSubdomain(h, "nflximg.net")) {
         return AppType::NETFLIX;
     }
-    
-    // Amazon
-    if (lower_sni.find("amazon") != std::string::npos ||
-        lower_sni.find("amazonaws") != std::string::npos ||
-        lower_sni.find("cloudfront") != std::string::npos ||
-        lower_sni.find("aws") != std::string::npos) {
+
+    // Amazon / AWS
+    // NOTE: "amazon" as substring would match "amazonsupport.evil.com".
+    // We only match known Amazon apex domains.
+    if (isDomainOrSubdomain(h, "amazon.com")    ||
+        isDomainOrSubdomain(h, "amazon.co.uk")  ||
+        isDomainOrSubdomain(h, "amazon.de")     ||
+        isDomainOrSubdomain(h, "amazonaws.com") ||
+        isDomainOrSubdomain(h, "cloudfront.net")||
+        isDomainOrSubdomain(h, "aws.amazon.com")) {
         return AppType::AMAZON;
     }
-    
+
     // Microsoft
-    if (lower_sni.find("microsoft") != std::string::npos ||
-        lower_sni.find("msn.com") != std::string::npos ||
-        lower_sni.find("office") != std::string::npos ||
-        lower_sni.find("azure") != std::string::npos ||
-        lower_sni.find("live.com") != std::string::npos ||
-        lower_sni.find("outlook") != std::string::npos ||
-        lower_sni.find("bing") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "microsoft.com") ||
+        isDomainOrSubdomain(h, "msn.com")       ||
+        isDomainOrSubdomain(h, "live.com")       ||
+        isDomainOrSubdomain(h, "outlook.com")    ||
+        isDomainOrSubdomain(h, "office.com")     ||
+        isDomainOrSubdomain(h, "office365.com")  ||
+        isDomainOrSubdomain(h, "azure.com")      ||
+        isDomainOrSubdomain(h, "bing.com")       ||
+        isDomainOrSubdomain(h, "windows.com")    ||
+        isDomainOrSubdomain(h, "microsoftonline.com")) {
         return AppType::MICROSOFT;
     }
-    
+
     // Apple
-    if (lower_sni.find("apple") != std::string::npos ||
-        lower_sni.find("icloud") != std::string::npos ||
-        lower_sni.find("mzstatic") != std::string::npos ||
-        lower_sni.find("itunes") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "apple.com")    ||
+        isDomainOrSubdomain(h, "icloud.com")   ||
+        isDomainOrSubdomain(h, "mzstatic.com") ||
+        isDomainOrSubdomain(h, "itunes.apple.com")) {
         return AppType::APPLE;
     }
-    
+
     // Telegram
-    if (lower_sni.find("telegram") != std::string::npos ||
-        lower_sni.find("t.me") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "telegram.org") ||
+        isDomainOrSubdomain(h, "telegram.me")  ||
+        isDomainOrSubdomain(h, "t.me")) {
         return AppType::TELEGRAM;
     }
-    
-    // TikTok
-    if (lower_sni.find("tiktok") != std::string::npos ||
-        lower_sni.find("tiktokcdn") != std::string::npos ||
-        lower_sni.find("musical.ly") != std::string::npos ||
-        lower_sni.find("bytedance") != std::string::npos) {
+
+    // TikTok / ByteDance
+    if (isDomainOrSubdomain(h, "tiktok.com")     ||
+        isDomainOrSubdomain(h, "tiktokcdn.com")  ||
+        isDomainOrSubdomain(h, "musical.ly")     ||
+        isDomainOrSubdomain(h, "bytedance.com")) {
         return AppType::TIKTOK;
     }
-    
+
     // Spotify
-    if (lower_sni.find("spotify") != std::string::npos ||
-        lower_sni.find("scdn.co") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "spotify.com") ||
+        isDomainOrSubdomain(h, "scdn.co")) {
         return AppType::SPOTIFY;
     }
-    
+
     // Zoom
-    if (lower_sni.find("zoom") != std::string::npos) {
+    // NOTE: "zoom" as substring would match "zoom-phishing.com".
+    // Only match the known Zoom apex domains.
+    if (isDomainOrSubdomain(h, "zoom.us")  ||
+        isDomainOrSubdomain(h, "zoom.com") ||
+        isDomainOrSubdomain(h, "zoomgov.com")) {
         return AppType::ZOOM;
     }
-    
+
     // Discord
-    if (lower_sni.find("discord") != std::string::npos ||
-        lower_sni.find("discordapp") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "discord.com") ||
+        isDomainOrSubdomain(h, "discord.gg")  ||
+        isDomainOrSubdomain(h, "discordapp.com")) {
         return AppType::DISCORD;
     }
-    
+
     // GitHub
-    if (lower_sni.find("github") != std::string::npos ||
-        lower_sni.find("githubusercontent") != std::string::npos) {
+    if (isDomainOrSubdomain(h, "github.com")          ||
+        isDomainOrSubdomain(h, "githubusercontent.com") ||
+        isDomainOrSubdomain(h, "github.io")) {
         return AppType::GITHUB;
     }
-    
+
     // Cloudflare
-    if (lower_sni.find("cloudflare") != std::string::npos ||
-        lower_sni.find("cf-") != std::string::npos) {
+    // NOTE: "cf-" as substring was wildly over-broad. Match only known Cloudflare domains.
+    if (isDomainOrSubdomain(h, "cloudflare.com") ||
+        isDomainOrSubdomain(h, "cloudflare.net") ||
+        isDomainOrSubdomain(h, "1.1.1.1") ||        // CF DNS (rare as SNI)
+        isDomainOrSubdomain(h, "workers.dev")    ||
+        isDomainOrSubdomain(h, "pages.dev")) {
         return AppType::CLOUDFLARE;
     }
-    
-    // If SNI is present but not recognized, still mark as TLS/HTTPS
+
+    // SNI present but not recognized → classify as generic HTTPS
     return AppType::HTTPS;
 }
 

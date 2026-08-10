@@ -69,10 +69,12 @@ void LoadBalancer::run() {
 }
 
 int LoadBalancer::selectFP(const FiveTuple& tuple) {
-    // Hash the five-tuple and map to one of our FPs
+    // FiveTupleHash hashes the canonical form of the tuple (fix E1).
+    // Both A->B and B->A therefore produce the same hash and select the same FP,
+    // ensuring bidirectional flow packets always reach the same worker thread.
     FiveTupleHash hasher;
-    size_t hash = hasher(tuple);
-    return hash % num_fps_;
+    size_t hash = hasher(tuple);  // hasher internally calls tuple.canonical()
+    return static_cast<int>(hash % static_cast<size_t>(num_fps_));
 }
 
 LoadBalancer::LBStats LoadBalancer::getStats() const {

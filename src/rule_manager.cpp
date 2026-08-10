@@ -1,7 +1,9 @@
 #include "rule_manager.h"
+#include "net_utils.h"
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <mutex>
 
 namespace DPI {
@@ -11,31 +13,12 @@ namespace DPI {
 // ============================================================================
 
 uint32_t RuleManager::parseIP(const std::string& ip) {
-    uint32_t result = 0;
-    int octet = 0;
-    int shift = 0;
-    
-    for (char c : ip) {
-        if (c == '.') {
-            result |= (octet << shift);
-            shift += 8;
-            octet = 0;
-        } else if (c >= '0' && c <= '9') {
-            octet = octet * 10 + (c - '0');
-        }
-    }
-    result |= (octet << shift);
-    
-    return result;
+    // Delegate to the canonical implementation in net_utils.h
+    return DPI::parseIPv4Address(ip);
 }
 
 std::string RuleManager::ipToString(uint32_t ip) {
-    std::ostringstream ss;
-    ss << ((ip >> 0) & 0xFF) << "."
-       << ((ip >> 8) & 0xFF) << "."
-       << ((ip >> 16) & 0xFF) << "."
-       << ((ip >> 24) & 0xFF);
-    return ss.str();
+    return DPI::ipv4ToString(ip);
 }
 
 void RuleManager::blockIP(uint32_t ip) {
@@ -150,28 +133,49 @@ bool RuleManager::domainMatchesPattern(const std::string& domain, const std::str
 }
 
 bool RuleManager::isDomainBlocked(const std::string& domain) const {
-    std::shared_lock<std::shared_mutex> lock(domain_mutex_);
-    
-    // Check exact match
-    if (blocked_domains_.count(domain) > 0) {
-        return true;
-    }
-    
-    // Check patterns
+    if (domain.empty()) return false;
+
+    // Normalize once OUTSIDE the lock — avoids allocation inside the read-lock.
     std::string lower_domain = domain;
     std::transform(lower_domain.begin(), lower_domain.end(), lower_domain.begin(),
                    [](unsigned char c) { return std::tolower(c); });
-    
+    // Strip trailing dot (FQDN notation)
+    if (!lower_domain.empty() && lower_domain.back() == '.') {
+        lower_domain.pop_back();
+    }
+
+    std::shared_lock<std::shared_mutex> lock(domain_mutex_);
+
+    // 1. Exact match against the normalized blocked set
+    if (blocked_domains_.count(lower_domain) > 0) {
+        return true;
+    }
+
+    // 2. Subdomain-of-exact-domain check (D6 fix):
+    //    blockDomain("evil.com") must also block "www.evil.com", "api.evil.com".
+    //    We check that lower_domain ends with "." + blocked_entry, ensuring a
+    //    dot-label boundary so "notevil.com" is NOT matched.
+    for (const auto& entry : blocked_domains_) {
+        if (lower_domain.size() > entry.size() + 1) {
+            size_t dot_pos = lower_domain.size() - entry.size() - 1;
+            if (lower_domain[dot_pos] == '.' &&
+                lower_domain.compare(dot_pos + 1, entry.size(), entry) == 0) {
+                return true;  // e.g. "www.evil.com" ends with ".evil.com"
+            }
+        }
+    }
+
+    // 3. Wildcard pattern match (existing behaviour preserved)
     for (const auto& pattern : domain_patterns_) {
         std::string lower_pattern = pattern;
         std::transform(lower_pattern.begin(), lower_pattern.end(), lower_pattern.begin(),
                        [](unsigned char c) { return std::tolower(c); });
-        
+
         if (domainMatchesPattern(lower_domain, lower_pattern)) {
             return true;
         }
     }
-    
+
     return false;
 }
 

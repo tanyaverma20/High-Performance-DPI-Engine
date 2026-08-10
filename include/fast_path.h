@@ -119,7 +119,7 @@ private:
     PacketAction checkRules(const PacketJob& job, Connection* conn);
     
     // Update TCP connection state
-    void updateTCPState(Connection* conn, uint8_t tcp_flags);
+    void updateTCPState(Connection* conn, uint8_t tcp_flags, bool is_client_to_server);
 };
 
 // ============================================================================

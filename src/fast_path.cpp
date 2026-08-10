@@ -77,53 +77,63 @@ void FastPathProcessor::run() {
 }
 
 PacketAction FastPathProcessor::processPacket(PacketJob& job) {
-    // Get or create connection
+    // Get or create connection (keyed by canonical tuple)
     Connection* conn = conn_tracker_.getOrCreateConnection(job.tuple);
     if (!conn) {
         // Should not happen, but handle gracefully
         return PacketAction::FORWARD;
     }
-    
-    // Update connection stats
-    bool is_outbound = true;  // In this model, all packets from user are outbound
-    conn_tracker_.updateConnection(conn, job.data.size(), is_outbound);
-    
+
+    // Determine direction: is this packet client→server (in-bound)?
+    // The connection stores original_is_canonical to tell us which direction
+    // the creator packet was in.  For the current packet:
+    //   - if canonical(job.tuple) == job.tuple, it's the same direction as original
+    //   - otherwise it's the reverse
+    bool is_client_to_server = (job.tuple.canonical() == job.tuple)
+                                ? conn->original_is_canonical
+                                : !conn->original_is_canonical;
+
+    // Update connection stats with correct direction
+    conn_tracker_.updateConnection(conn, job.data.size(), is_client_to_server);
+
     // Update TCP state if applicable
     if (job.tuple.protocol == 6) {  // TCP
-        updateTCPState(conn, job.tcp_flags);
+        updateTCPState(conn, job.tcp_flags, is_client_to_server);
     }
-    
+
     // If connection is already blocked, drop immediately
     if (conn->state == ConnectionState::BLOCKED) {
         return PacketAction::DROP;
     }
-    
+
     // If connection not yet classified, try to inspect payload
     if (conn->state != ConnectionState::CLASSIFIED && job.payload_length > 0) {
         inspectPayload(job, conn);
     }
-    
+
     // Check rules (even for classified connections, as rules might change)
     return checkRules(job, conn);
 }
 
 void FastPathProcessor::inspectPayload(PacketJob& job, Connection* conn) {
-    if (job.payload_length == 0 || job.payload_offset >= job.data.size()) {
+    if (job.payload_length == 0) {
         return;
     }
-    
-    const uint8_t* payload = job.data.data() + job.payload_offset;
-    
+
+    // Fix (D9): Use getPayload() — never touches a moved-from vector
+    const uint8_t* payload = job.getPayload();
+    if (!payload) return;
+
     // Try TLS SNI extraction first (most common for HTTPS)
     if (tryExtractSNI(job, conn)) {
         return;
     }
-    
+
     // Try HTTP Host header extraction
     if (tryExtractHTTPHost(job, conn)) {
         return;
     }
-    
+
     // Check for DNS (port 53)
     if (job.tuple.dst_port == 53 || job.tuple.src_port == 53) {
         auto domain = DNSExtractor::extractQuery(payload, job.payload_length);
@@ -132,7 +142,7 @@ void FastPathProcessor::inspectPayload(PacketJob& job, Connection* conn) {
             return;
         }
     }
-    
+
     // Basic port-based classification as fallback
     if (job.tuple.dst_port == 80) {
         conn_tracker_.classifyConnection(conn, AppType::HTTP, "");
@@ -142,31 +152,35 @@ void FastPathProcessor::inspectPayload(PacketJob& job, Connection* conn) {
 }
 
 bool FastPathProcessor::tryExtractSNI(const PacketJob& job, Connection* conn) {
-    // Only for port 443 (HTTPS) or if it looks like TLS
+    // Gate: attempt TLS SNI extraction on port 443, or on any large payload
+    // that might be TLS (the original condition `dst_port != 443 && payload < 50`
+    // was a logical bug — it skipped port-443 packets with short payloads but
+    // also skipped non-443 ports even with large payloads).
     if (job.tuple.dst_port != 443 && job.payload_length < 50) {
         return false;
     }
-    
-    if (job.payload_offset >= job.data.size() || job.payload_length == 0) {
+
+    // Fix (D9): use getPayload() — safe after move
+    const uint8_t* payload = job.getPayload();
+    if (!payload || job.payload_length == 0) {
         return false;
     }
-    
-    const uint8_t* payload = job.data.data() + job.payload_offset;
+
     auto sni = SNIExtractor::extract(payload, job.payload_length);
     if (sni) {
         sni_extractions_++;
-        
+
         // Map SNI to app type
         AppType app = sniToAppType(*sni);
         conn_tracker_.classifyConnection(conn, app, *sni);
-        
+
         if (app != AppType::UNKNOWN && app != AppType::HTTPS) {
             classification_hits_++;
         }
-        
+
         return true;
     }
-    
+
     return false;
 }
 
@@ -175,24 +189,25 @@ bool FastPathProcessor::tryExtractHTTPHost(const PacketJob& job, Connection* con
     if (job.tuple.dst_port != 80) {
         return false;
     }
-    
-    if (job.payload_offset >= job.data.size() || job.payload_length == 0) {
+
+    // Fix (D9): use getPayload()
+    const uint8_t* payload = job.getPayload();
+    if (!payload || job.payload_length == 0) {
         return false;
     }
-    
-    const uint8_t* payload = job.data.data() + job.payload_offset;
+
     auto host = HTTPHostExtractor::extract(payload, job.payload_length);
     if (host) {
         AppType app = sniToAppType(*host);
         conn_tracker_.classifyConnection(conn, app, *host);
-        
+
         if (app != AppType::UNKNOWN && app != AppType::HTTP) {
             classification_hits_++;
         }
-        
+
         return true;
     }
-    
+
     return false;
 }
 
@@ -243,37 +258,52 @@ PacketAction FastPathProcessor::checkRules(const PacketJob& job, Connection* con
     return PacketAction::FORWARD;
 }
 
-void FastPathProcessor::updateTCPState(Connection* conn, uint8_t tcp_flags) {
+void FastPathProcessor::updateTCPState(Connection* conn,
+                                        uint8_t tcp_flags,
+                                        bool is_client_to_server) {
     constexpr uint8_t SYN = 0x02;
     constexpr uint8_t ACK = 0x10;
     constexpr uint8_t FIN = 0x01;
     constexpr uint8_t RST = 0x04;
-    
+
+    // With flow canonicalization both directions arrive at this FP, so we
+    // can now observe the full 3-way handshake:
+    //   Client→Server SYN      : syn_seen = true
+    //   Server→Client SYN-ACK  : syn_ack_seen = true
+    //   Client→Server ACK      : state = ESTABLISHED
+
     if (tcp_flags & SYN) {
         if (tcp_flags & ACK) {
+            // SYN-ACK: should come from server (not client-to-server)
             conn->syn_ack_seen = true;
         } else {
+            // Pure SYN: should come from client (client-to-server)
             conn->syn_seen = true;
         }
     }
-    
-    if (conn->syn_seen && conn->syn_ack_seen && (tcp_flags & ACK)) {
+
+    // Complete handshake: SYN seen, SYN-ACK seen, now receiving plain ACK
+    if (conn->syn_seen && conn->syn_ack_seen &&
+        (tcp_flags & ACK) && !(tcp_flags & SYN)) {
         if (conn->state == ConnectionState::NEW) {
             conn->state = ConnectionState::ESTABLISHED;
         }
     }
-    
+
     if (tcp_flags & FIN) {
         conn->fin_seen = true;
     }
-    
+
     if (tcp_flags & RST) {
         conn->state = ConnectionState::CLOSED;
     }
-    
-    if (conn->fin_seen && (tcp_flags & ACK)) {
+
+    if (conn->fin_seen && (tcp_flags & ACK) && !(tcp_flags & SYN)) {
         conn->state = ConnectionState::CLOSED;
     }
+
+    // Suppress unused parameter warning (direction used for documentation)
+    (void)is_client_to_server;
 }
 
 FastPathProcessor::FPStats FastPathProcessor::getStats() const {

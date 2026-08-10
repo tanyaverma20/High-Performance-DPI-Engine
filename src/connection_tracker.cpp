@@ -15,56 +15,61 @@ ConnectionTracker::ConnectionTracker(int fp_id, size_t max_connections)
 }
 
 Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
-    auto it = connections_.find(tuple);
-    
+    // Fix (D7/E1): Always key by the canonical (direction-independent) form.
+    // Both A->B and B->A produce the same canonical key, so they share one
+    // Connection entry even when they arrive at different times.
+    FiveTuple key = tuple.canonical();
+
+    auto it = connections_.find(key);
     if (it != connections_.end()) {
         return &it->second;
     }
-    
+
     // Check if we need to evict old connections
     if (connections_.size() >= max_connections_) {
         evictOldest();
     }
-    
-    // Create new connection
+
+    // Create new connection, keyed by canonical tuple
     Connection conn;
-    conn.tuple = tuple;
-    conn.state = ConnectionState::NEW;
-    conn.first_seen = std::chrono::steady_clock::now();
-    conn.last_seen = conn.first_seen;
-    
-    auto result = connections_.emplace(tuple, std::move(conn));
+    conn.tuple              = key;
+    conn.original_is_canonical = (tuple == key);  // true = creator was client->server
+    conn.state              = ConnectionState::NEW;
+    conn.first_seen         = std::chrono::steady_clock::now();
+    conn.last_seen          = conn.first_seen;
+
+    auto result = connections_.emplace(key, std::move(conn));
     total_seen_++;
-    
+
     return &result.first->second;
 }
 
 Connection* ConnectionTracker::getConnection(const FiveTuple& tuple) {
-    auto it = connections_.find(tuple);
+    // Fix: look up by canonical — no separate reverse-lookup needed any more
+    // because getOrCreateConnection already stored by canonical key.
+    FiveTuple key = tuple.canonical();
+    auto it = connections_.find(key);
     if (it != connections_.end()) {
         return &it->second;
     }
-    
-    // Try reverse tuple (for bidirectional matching)
-    auto rev = connections_.find(tuple.reverse());
-    if (rev != connections_.end()) {
-        return &rev->second;
-    }
-    
     return nullptr;
 }
 
-void ConnectionTracker::updateConnection(Connection* conn, size_t packet_size, bool is_outbound) {
+void ConnectionTracker::updateConnection(Connection* conn,
+                                          size_t packet_size,
+                                          bool is_client_to_server) {
     if (!conn) return;
-    
+
     conn->last_seen = std::chrono::steady_clock::now();
-    
-    if (is_outbound) {
-        conn->packets_out++;
-        conn->bytes_out += packet_size;
-    } else {
+
+    // is_client_to_server == true  → in-bound (client sends to server)
+    // is_client_to_server == false → out-bound (server replies to client)
+    if (is_client_to_server) {
         conn->packets_in++;
         conn->bytes_in += packet_size;
+    } else {
+        conn->packets_out++;
+        conn->bytes_out += packet_size;
     }
 }
 
