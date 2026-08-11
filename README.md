@@ -38,6 +38,19 @@ This engine is a multi-threaded C++17 software DPI system engineered for high-th
 
 ---
 
+## Preview
+
+<p align="center">
+  <img src="docs/dashboard-preview.png" alt="High-Performance DPI Engine dashboard" width="100%">
+</p>
+
+<p align="center">
+  Interactive dashboard for PCAP analysis, traffic policy controls, flow tracking,
+  protocol inspection, and reproducible performance benchmarking.
+</p>
+
+---
+
 ## Key Features
 
 | Domain | Feature | Engineering Implementation |
