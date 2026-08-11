@@ -377,6 +377,11 @@ To run the reproducible benchmark suite with synthetic workloads:
 
 ---
 
-## License
+---
 
-This project is licensed under the [MIT License](LICENSE).
+## Author
+
+**Tanya Verma**  
+Computer Science Engineering | Thapar Institute of Engineering and Technology
+
+[GitHub](https://github.com/tanyaverma20) 
