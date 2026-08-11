@@ -6,6 +6,10 @@
 #include <cctype>
 #include <mutex>
 
+#ifdef DOMAIN
+#undef DOMAIN
+#endif
+
 namespace DPI {
 
 // ============================================================================

@@ -11,6 +11,10 @@
 #include <vector>
 #include <fstream>
 
+#ifdef DOMAIN
+#undef DOMAIN
+#endif
+
 namespace DPI {
 
 // ============================================================================
@@ -90,6 +94,9 @@ public:
     
     // Check if a packet/connection should be blocked based on all rules
     // Returns the reason if blocked, nullopt if allowed
+#ifdef DOMAIN
+#undef DOMAIN
+#endif
     struct BlockReason {
         enum Type { IP, APP, DOMAIN, PORT } type;
         std::string detail;
