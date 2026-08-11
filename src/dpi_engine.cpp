@@ -543,6 +543,148 @@ std::string DPIEngine::generateClassificationReport() const {
     return "";
 }
 
+std::string DPIEngine::generateJSONReport(double elapsed_seconds) const {
+    std::ostringstream ss;
+    
+    uint64_t total_pkts = stats_.total_packets.load();
+    uint64_t total_bytes = stats_.total_bytes.load();
+    uint64_t fwd_pkts = stats_.forwarded_packets.load();
+    uint64_t drop_pkts = stats_.dropped_packets.load();
+    std::vector<Connection> all_conns;
+    if (fp_manager_) {
+        int total_fps = config_.num_load_balancers * config_.fps_per_lb;
+        for (int i = 0; i < total_fps; i++) {
+            auto fp_conns = fp_manager_->getFP(i).getConnectionTracker().getAllConnections();
+            all_conns.insert(all_conns.end(), fp_conns.begin(), fp_conns.end());
+        }
+    }
+
+    uint64_t tcp_pkts = stats_.tcp_packets.load();
+    uint64_t udp_pkts = stats_.udp_packets.load();
+    if (tcp_pkts == 0 && udp_pkts == 0) {
+        for (const auto& conn : all_conns) {
+            uint64_t p = conn.packets_in + conn.packets_out;
+            if (conn.flow_key.protocol == 6) tcp_pkts += p;
+            else if (conn.flow_key.protocol == 17) udp_pkts += p;
+        }
+    }
+    uint64_t other_pkts = (total_pkts > (tcp_pkts + udp_pkts)) ? (total_pkts - tcp_pkts - udp_pkts) : stats_.other_packets.load();
+
+    double pps = (elapsed_seconds > 0.0) ? (total_pkts / elapsed_seconds) : 0.0;
+    double mbps = (elapsed_seconds > 0.0) ? ((total_bytes * 8.0) / (1000000.0 * elapsed_seconds)) : 0.0;
+
+    ss << "{\n";
+    ss << "  \"summary\": {\n";
+    ss << "    \"total_packets\": " << total_pkts << ",\n";
+    ss << "    \"total_bytes\": " << total_bytes << ",\n";
+    ss << "    \"forwarded_packets\": " << fwd_pkts << ",\n";
+    ss << "    \"dropped_packets\": " << drop_pkts << ",\n";
+    ss << "    \"tcp_packets\": " << tcp_pkts << ",\n";
+    ss << "    \"udp_packets\": " << udp_pkts << ",\n";
+    ss << "    \"other_packets\": " << other_pkts << ",\n";
+    ss << "    \"elapsed_seconds\": " << std::fixed << std::setprecision(4) << elapsed_seconds << ",\n";
+    ss << "    \"packets_per_second\": " << std::fixed << std::setprecision(2) << pps << ",\n";
+    ss << "    \"mb_per_second\": " << std::fixed << std::setprecision(2) << mbps << "\n";
+    ss << "  },\n";
+
+    ss << "  \"protocols\": {\n";
+    ss << "    \"TCP\": " << tcp_pkts << ",\n";
+    ss << "    \"UDP\": " << udp_pkts << ",\n";
+    ss << "    \"Other\": " << other_pkts << "\n";
+    ss << "  },\n";
+
+    struct AppSummary {
+        size_t flows = 0;
+        uint64_t packets = 0;
+        uint64_t bytes = 0;
+        bool blocked = false;
+    };
+    std::unordered_map<std::string, AppSummary> app_map;
+
+    struct DomainSummary {
+        std::string app;
+        uint64_t packets = 0;
+        bool blocked = false;
+    };
+    std::unordered_map<std::string, DomainSummary> domain_map;
+
+    for (const auto& conn : all_conns) {
+        std::string app_name = appTypeToString(conn.app_type);
+        uint64_t pkts = conn.packets_in + conn.packets_out;
+        uint64_t bytes = conn.bytes_in + conn.bytes_out;
+        bool is_blocked = (conn.action == PacketAction::DROP || conn.state == ConnectionState::BLOCKED);
+
+        auto& app_entry = app_map[app_name];
+        app_entry.flows++;
+        app_entry.packets += pkts;
+        app_entry.bytes += bytes;
+        if (is_blocked) app_entry.blocked = true;
+
+        std::string domain = conn.bestDomain();
+        if (!domain.empty()) {
+            auto& dom_entry = domain_map[domain];
+            dom_entry.app = app_name;
+            dom_entry.packets += pkts;
+            if (is_blocked) dom_entry.blocked = true;
+        }
+    }
+
+    ss << "  \"applications\": [\n";
+    size_t app_idx = 0;
+    for (const auto& pair : app_map) {
+        ss << "    {\n";
+        ss << "      \"name\": \"" << pair.first << "\",\n";
+        ss << "      \"flows\": " << pair.second.flows << ",\n";
+        ss << "      \"packets\": " << pair.second.packets << ",\n";
+        ss << "      \"bytes\": " << pair.second.bytes << ",\n";
+        ss << "      \"status\": \"" << (pair.second.blocked ? "BLOCKED" : "FORWARDED") << "\"\n";
+        ss << "    }" << (app_idx + 1 < app_map.size() ? "," : "") << "\n";
+        app_idx++;
+    }
+    ss << "  ],\n";
+
+    ss << "  \"domains\": [\n";
+    size_t dom_idx = 0;
+    for (const auto& pair : domain_map) {
+        ss << "    {\n";
+        ss << "      \"domain\": \"" << pair.first << "\",\n";
+        ss << "      \"application\": \"" << pair.second.app << "\",\n";
+        ss << "      \"packets\": " << pair.second.packets << ",\n";
+        ss << "      \"status\": \"" << (pair.second.blocked ? "BLOCKED" : "FORWARDED") << "\"\n";
+        ss << "    }" << (dom_idx + 1 < domain_map.size() ? "," : "") << "\n";
+        dom_idx++;
+    }
+    ss << "  ],\n";
+
+    ss << "  \"flows\": [\n";
+    size_t flow_idx = 0;
+    for (const auto& conn : all_conns) {
+        std::string state_str = "NEW";
+        if (conn.state == ConnectionState::ESTABLISHED) state_str = "ESTABLISHED";
+        else if (conn.state == ConnectionState::CLASSIFIED) state_str = "CLASSIFIED";
+        else if (conn.state == ConnectionState::BLOCKED) state_str = "BLOCKED";
+        else if (conn.state == ConnectionState::CLOSED) state_str = "CLOSED";
+
+        std::string action_str = (conn.action == PacketAction::DROP) ? "DROP" : "FORWARD";
+
+        ss << "    {\n";
+        ss << "      \"flow\": \"" << conn.flow_key.toString() << "\",\n";
+        ss << "      \"protocol\": \"" << (conn.flow_key.protocol == 6 ? "TCP" : (conn.flow_key.protocol == 17 ? "UDP" : "OTHER")) << "\",\n";
+        ss << "      \"application\": \"" << appTypeToString(conn.app_type) << "\",\n";
+        ss << "      \"domain\": \"" << conn.bestDomain() << "\",\n";
+        ss << "      \"state\": \"" << state_str << "\",\n";
+        ss << "      \"action\": \"" << action_str << "\",\n";
+        ss << "      \"packets\": " << (conn.packets_in + conn.packets_out) << ",\n";
+        ss << "      \"bytes\": " << (conn.bytes_in + conn.bytes_out) << "\n";
+        ss << "    }" << (flow_idx + 1 < all_conns.size() ? "," : "") << "\n";
+        flow_idx++;
+    }
+    ss << "  ]\n";
+    ss << "}\n";
+
+    return ss.str();
+}
+
 const DPIStats& DPIEngine::getStats() const {
     return stats_;
 }

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>High-Performance DPI Engine — Local Web Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Navigation Bar -->
+        <header class="navbar">
+            <div class="brand">
+                <div class="logo-icon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                    </svg>
+                </div>
+                <div class="brand-text">
+                    <h1>High-Performance DPI Engine</h1>
+                    <span class="subtitle">C++17 Stateful Deep Packet Inspection & Traffic Intelligence System</span>
+                </div>
+            </div>
+            <div class="status-panel">
+                <div id="statusBadge" class="badge status-badge checking">
+                    <span class="dot"></span>
+                    <span id="statusText">Connecting...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Control Bar & Traffic Ingestion -->
+        <section class="control-card">
+            <div class="card-header">
+                <h2>Analysis Control & Rule Configuration</h2>
+                <p>Ingest raw PCAP streams or run synthetic traffic analysis through the C++ multi-threaded engine.</p>
+            </div>
+            <div class="control-grid">
+                <!-- Dropzone / File Selector -->
+                <div class="dropzone" id="dropzone">
+                    <input type="file" id="pcapInput" accept=".pcap,.pcapng" class="file-input">
+                    <div class="dropzone-content">
+                        <svg class="upload-icon" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <div class="upload-text">
+                            <span class="primary-text">Click to upload PCAP</span> or drag & drop file
+                        </div>
+                        <span class="file-info" id="selectedFileInfo">Supports .pcap / .pcapng files</span>
+                    </div>
+                </div>
+
+                <!-- Blocking Rules & Controls -->
+                <div class="rules-config">
+                    <label class="section-label">Active Blocking Rules (Command-Line Override)</label>
+                    <div class="rule-checkboxes">
+                        <label class="checkbox-pill">
+                            <input type="checkbox" id="blockAppYouTube" value="YouTube">
+                            <span>Block YouTube</span>
+                        </label>
+                        <label class="checkbox-pill">
+                            <input type="checkbox" id="blockAppFacebook" value="Facebook">
+                            <span>Block Facebook</span>
+                        </label>
+                        <label class="checkbox-pill">
+                            <input type="checkbox" id="blockAppTikTok" value="TikTok">
+                            <span>Block TikTok</span>
+                        </label>
+                        <label class="checkbox-pill">
+                            <input type="checkbox" id="blockAppNetflix" value="Netflix">
+                            <span>Block Netflix</span>
+                        </label>
+                    </div>
+
+                    <div class="input-group">
+                        <label for="customDomain">Custom Wildcard Domain Block:</label>
+                        <input type="text" id="customDomain" placeholder="e.g. *.evil.com or badsite.org">
+                    </div>
+
+                    <div class="action-buttons">
+                        <button id="btnAnalyze" class="btn btn-primary">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                            </svg>
+                            <span>Analyze PCAP</span>
+                        </button>
+                        <button id="btnSample" class="btn btn-secondary">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <polyline points="12 6 12 12 16 14"></polyline>
+                            </svg>
+                            <span>Run Sample PCAP (test_dpi.pcap)</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Progress / Loading Banner -->
+            <div id="progressBanner" class="progress-banner hidden">
+                <div class="spinner"></div>
+                <div class="progress-info">
+                    <span id="progressStep" class="step-title">Initializing C++ Engine Subprocess...</span>
+                    <span class="step-desc">Executing parallel frame parsing, flow affinity hashing, stream reassembly, and classification.</span>
+                </div>
+            </div>
+
+            <!-- Error Banner -->
+            <div id="errorBanner" class="error-banner hidden">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <line x1="12" y1="8" x2="12" y2="12"></line>
+                    <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                </svg>
+                <span id="errorMessage">Error details</span>
+            </div>
+        </section>
+
+        <!-- Main Results Grid (Hidden until analysis runs) -->
+        <main id="resultsContainer" class="results-container hidden">
+            <!-- Top Metric Cards -->
+            <div class="metrics-grid">
+                <div class="metric-card">
+                    <span class="metric-label">Packets Processed</span>
+                    <span class="metric-value" id="valTotalPackets">0</span>
+                    <span class="metric-sub" id="valForwardedVsDropped">Forwarded: 0 | Dropped: 0</span>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-label">Total Data Processed</span>
+                    <span class="metric-value" id="valTotalBytes">0 B</span>
+                    <span class="metric-sub">Aggregated frame payload size</span>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-label">Current Analysis Speed</span>
+                    <span class="metric-value" id="valAnalysisPps">0 pps</span>
+                    <span class="metric-sub" id="valAnalysisBps">0.00 MB/s</span>
+                </div>
+                <div class="metric-card">
+                    <span class="metric-label">Active Flow Connections</span>
+                    <span class="metric-value" id="valActiveFlows">0</span>
+                    <span class="metric-sub">Stateful 5-tuple tracking</span>
+                </div>
+                <div class="metric-card highlight-card">
+                    <span class="metric-label">Policy Action Summary</span>
+                    <span class="metric-value" id="valBlockedCount">0</span>
+                    <span class="metric-sub" id="valDropRate">0.00% Drop Rate</span>
+                </div>
+            </div>
+
+            <!-- Two-Column Layout: Protocols & Reference Benchmark -->
+            <div class="grid-2col">
+                <!-- Protocol Distribution -->
+                <div class="panel-card">
+                    <div class="panel-header">
+                        <h3>L3 / L4 Protocol Breakdown</h3>
+                        <span class="panel-tag">Raw Frame Parsers</span>
+                    </div>
+                    <div class="protocol-bars">
+                        <div class="bar-group">
+                            <div class="bar-label">
+                                <span>TCP (Transmission Control Protocol)</span>
+                                <span id="lblTcpCount">0 pkts</span>
+                            </div>
+                            <div class="bar-track">
+                                <div class="bar-fill tcp" id="barTcp" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="bar-group">
+                            <div class="bar-label">
+                                <span>UDP (User Datagram Protocol)</span>
+                                <span id="lblUdpCount">0 pkts</span>
+                            </div>
+                            <div class="bar-track">
+                                <div class="bar-fill udp" id="barUdp" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="bar-group">
+                            <div class="bar-label">
+                                <span>ICMP / Other Network Protocols</span>
+                                <span id="lblOtherCount">0 pkts</span>
+                            </div>
+                            <div class="bar-track">
+                                <div class="bar-fill other" id="barOther" style="width: 0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Reference Benchmark Panel -->
+                <div class="panel-card benchmark-panel">
+                    <div class="panel-header">
+                        <h3>Authoritative System Benchmark</h3>
+                        <span class="panel-tag badge-verified">Verified CI Baseline</span>
+                    </div>
+                    <div class="benchmark-content">
+                        <div class="benchmark-stat-main">
+                            <div class="bench-metric">
+                                <span class="bench-val">651,474</span>
+                                <span class="bench-unit">pkts/sec</span>
+                            </div>
+                            <div class="bench-metric">
+                                <span class="bench-val">33.55</span>
+                                <span class="bench-unit">MB/sec</span>
+                            </div>
+                            <div class="bench-metric">
+                                <span class="bench-val">3.19x</span>
+                                <span class="bench-unit">Parallel Speedup</span>
+                            </div>
+                        </div>
+                        <div class="benchmark-details">
+                            <div class="bench-item"><strong>Workload:</strong> 1,000,000 synthetic TCP packets</div>
+                            <div class="bench-item"><strong>Worker Config:</strong> 8 Parsers + 4 FastPath threads</div>
+                            <div class="bench-item"><strong>Packet Drops:</strong> 0 drops (0.00% loss)</div>
+                            <div class="bench-item"><strong>Platform:</strong> Containerized GitHub Actions Ubuntu runner</div>
+                        </div>
+                        <p class="bench-note">
+                            <strong>Note:</strong> Observed benchmark result on the project's reproducible GitHub Actions workload; actual local execution speed depends on PCAP size, host hardware, and thread scheduling.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Application Classification Table -->
+            <div class="panel-card">
+                <div class="panel-header">
+                    <h3>Application Layer Intelligence & Classification</h3>
+                    <span class="panel-tag">SNI > HTTP > DNS</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Application</th>
+                                <th>Flow Connections</th>
+                                <th>Packets</th>
+                                <th>Total Bytes</th>
+                                <th>Filter Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tblApplications">
+                            <tr><td colspan="5" class="empty-cell">No application data available</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Domain Intelligence Table -->
+            <div class="panel-card">
+                <div class="panel-header">
+                    <h3>Domain Intelligence & Wildcard Matching</h3>
+                    <span class="panel-tag">Rule Engine</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Domain Name</th>
+                                <th>Classification</th>
+                                <th>Packets</th>
+                                <th>Filter Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tblDomains">
+                            <tr><td colspan="4" class="empty-cell">No domain inspection data available</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Stateful Connection Flow Table -->
+            <div class="panel-card">
+                <div class="panel-header">
+                    <h3>Active Connection Flow Table (Canonical 5-Tuple)</h3>
+                    <span class="panel-tag">Stateful Tracker</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Canonical Flow Key</th>
+                                <th>Proto</th>
+                                <th>App</th>
+                                <th>Best Domain</th>
+                                <th>State</th>
+                                <th>Packets</th>
+                                <th>Bytes</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tblFlows">
+                            <tr><td colspan="8" class="empty-cell">No active flow data available</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

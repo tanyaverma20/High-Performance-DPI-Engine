@@ -130,6 +130,9 @@ public:
     // Generate classification report (app distribution)
     std::string generateClassificationReport() const;
     
+    // Generate machine-readable JSON report for web dashboard
+    std::string generateJSONReport(double elapsed_seconds = 0.0) const;
+    
     // Get real-time statistics
     const DPIStats& getStats() const;
     

@@ -2,6 +2,8 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <chrono>
+#include <fstream>
 #include "dpi_engine.h"
 
 using namespace DPI;
@@ -24,41 +26,10 @@ Options:
   --block-app <app>      Block application (e.g., YouTube, Facebook)
   --block-domain <dom>   Block domain (supports wildcards: *.facebook.com)
   --rules <file>         Load blocking rules from file
+  --json <file>          Export structured JSON report for dashboard
   --lbs <n>              Number of load balancer threads (default: 2)
   --fps <n>              FP threads per LB (default: 2)
   --verbose              Enable verbose output
-
-Examples:
-  )" << program << R"( capture.pcap filtered.pcap
-  )" << program << R"( capture.pcap filtered.pcap --block-app YouTube
-  )" << program << R"( capture.pcap filtered.pcap --block-ip 192.168.1.50 --block-domain *.tiktok.com
-  )" << program << R"( capture.pcap filtered.pcap --rules blocking_rules.txt
-
-Supported Apps for Blocking:
-  Google, YouTube, Facebook, Instagram, Twitter/X, Netflix, Amazon,
-  Microsoft, Apple, WhatsApp, Telegram, TikTok, Spotify, Zoom, Discord, GitHub
-
-Architecture:
-  ┌─────────────┐
-  │ PCAP Reader │  Reads packets from input file
-  └──────┬──────┘
-         │ hash(5-tuple) % num_lbs
-         ▼
-  ┌──────┴──────┐
-  │ Load Balancer │  2 LB threads distribute to FPs
-  │   LB0 │ LB1   │
-  └──┬────┴────┬──┘
-     │         │  hash(5-tuple) % fps_per_lb
-     ▼         ▼
-  ┌──┴──┐   ┌──┴──┐
-  │FP0-1│   │FP2-3│  4 FP threads: DPI, classification, blocking
-  └──┬──┘   └──┬──┘
-     │         │
-     ▼         ▼
-  ┌──┴─────────┴──┐
-  │ Output Writer │  Writes forwarded packets to output
-  └───────────────┘
-
 )";
 }
 
@@ -90,6 +61,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> block_apps;
     std::vector<std::string> block_domains;
     std::string rules_file;
+    std::string json_file;
     
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -102,6 +74,8 @@ int main(int argc, char* argv[]) {
             block_domains.push_back(argv[++i]);
         } else if (arg == "--rules" && i + 1 < argc) {
             rules_file = argv[++i];
+        } else if (arg == "--json" && i + 1 < argc) {
+            json_file = argv[++i];
         } else if ((arg == "--parser-workers" || arg == "-p") && i + 1 < argc) {
             int p = std::stoi(argv[++i]);
             if (p < 1) {
@@ -148,14 +122,28 @@ int main(int argc, char* argv[]) {
         engine.blockDomain(domain);
     }
     
-    // Process the file
+    // Process the file with timing
+    auto start_time = std::chrono::high_resolution_clock::now();
     if (!engine.processFile(input_file, output_file)) {
         std::cerr << "Failed to process file\n";
         return 1;
     }
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
     
     std::cout << "\nProcessing complete!\n";
     std::cout << "Output written to: " << output_file << "\n";
+
+    if (!json_file.empty()) {
+        std::ofstream jout(json_file);
+        if (jout.is_open()) {
+            jout << engine.generateJSONReport(elapsed.count());
+            jout.close();
+            std::cout << "JSON report written to: " << json_file << "\n";
+        } else {
+            std::cerr << "Failed to write JSON report to: " << json_file << "\n";
+        }
+    }
     
     return 0;
 }
