@@ -1,0 +1,60 @@
+name: DPI Engine Build & Test CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release Configuration
+        run: cmake --build build --config Release
+
+      - name: Execute Correctness Test Suite (CTest)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Execute Correctness Test Suite (Direct Binary Execution)
+        shell: bash
+        run: |
+          if [ -f "./build/dpi_tests" ]; then
+            ./build/dpi_tests
+          elif [ -f "./build/Release/dpi_tests.exe" ]; then
+            ./build/Release/dpi_tests.exe
+          elif [ -f "./build/dpi_tests.exe" ]; then
+            ./build/dpi_tests.exe
+          else
+            echo "dpi_tests binary not found!"
+            exit 1
+          fi
+
+  sanitizers:
+    name: AddressSanitizer & UndefinedBehaviorSanitizer (Ubuntu GCC)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake with ASAN and UBSAN
+        run: cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+
+      - name: Build Sanitizer Target
+        run: cmake --build build-san
+
+      - name: Execute Correctness Tests under ASAN + UBSAN
+        run: ./build-san/dpi_tests

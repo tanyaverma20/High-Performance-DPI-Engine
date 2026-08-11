@@ -102,6 +102,13 @@ int main(int argc, char* argv[]) {
             block_domains.push_back(argv[++i]);
         } else if (arg == "--rules" && i + 1 < argc) {
             rules_file = argv[++i];
+        } else if ((arg == "--parser-workers" || arg == "-p") && i + 1 < argc) {
+            int p = std::stoi(argv[++i]);
+            if (p < 1) {
+                std::cerr << "[Warning] Invalid parser worker count (" << p << "), defaulting to 1\n";
+                p = 1;
+            }
+            config.num_parser_workers = p;
         } else if (arg == "--lbs" && i + 1 < argc) {
             config.num_load_balancers = std::stoi(argv[++i]);
         } else if (arg == "--fps" && i + 1 < argc) {

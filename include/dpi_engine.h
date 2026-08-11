@@ -8,6 +8,7 @@
 #include "fast_path.h"
 #include "rule_manager.h"
 #include "connection_tracker.h"
+#include "parser_pool.h"
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -23,8 +24,14 @@ namespace DPI {
 // Architecture Overview:
 //
 //   +------------------+
-//   |   PCAP Reader    |  (Reads packets from input file)
+//   |   PCAP Reader    |  (Reads raw packets from input file)
 //   +--------+---------+
+//            |
+//            v (raw_packet_queue_)
+//   +--------+----------+
+//   |  Parser Pool     |  (N parser workers)
+//   |  Worker0 Worker1 |
+//   +--------+----------+
 //            |
 //            v (hash to select LB)
 //   +--------+----------+
@@ -54,6 +61,7 @@ class DPIEngine {
 public:
     // Configuration
     struct Config {
+        int num_parser_workers = 2;
         int num_load_balancers = 2;
         int fps_per_lb = 2;
         size_t queue_size = 10000;
@@ -72,6 +80,10 @@ public:
     // output_file: Path to output PCAP (forwarded traffic)
     bool processFile(const std::string& input_file, 
                      const std::string& output_file);
+    
+    // Process synthetic packets for benchmarking
+    bool processSynthetic(int num_packets);
+    bool processSynthetic(const std::vector<RawPacketJob>& dataset);
     
     // Start the engine (starts all threads)
     void start();
@@ -138,6 +150,8 @@ private:
     std::unique_ptr<GlobalConnectionTable> global_conn_table_;
     
     // Thread pools
+    ThreadSafeQueue<RawPacketJob> raw_packet_queue_;
+    std::unique_ptr<ParserManager> parser_manager_;
     std::unique_ptr<FPManager> fp_manager_;
     std::unique_ptr<LBManager> lb_manager_;
     

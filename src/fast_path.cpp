@@ -1,7 +1,9 @@
 #include "fast_path.h"
+#include "sni_extractor.h"
+#include "packet_parser.h"
+#include "profiler.h"
 #include <iostream>
-#include <sstream>
-#include <iomanip>
+#include <chrono>
 
 namespace DPI {
 
@@ -9,14 +11,12 @@ namespace DPI {
 // FastPathProcessor Implementation
 // ============================================================================
 
-FastPathProcessor::FastPathProcessor(int fp_id,
-                                     RuleManager* rule_manager,
-                                     PacketOutputCallback output_callback)
+FastPathProcessor::FastPathProcessor(int fp_id, RuleManager* rule_manager, OutputCallback output_cb)
     : fp_id_(fp_id),
-      input_queue_(10000),
-      conn_tracker_(fp_id),
       rule_manager_(rule_manager),
-      output_callback_(std::move(output_callback)) {
+      output_cb_(std::move(output_cb)),
+      input_queue_(10000),
+      connection_tracker_(fp_id, 100000) {
 }
 
 FastPathProcessor::~FastPathProcessor() {
@@ -25,313 +25,233 @@ FastPathProcessor::~FastPathProcessor() {
 
 void FastPathProcessor::start() {
     if (running_) return;
-    
     running_ = true;
     thread_ = std::thread(&FastPathProcessor::run, this);
-    
     std::cout << "[FP" << fp_id_ << "] Started\n";
 }
 
 void FastPathProcessor::stop() {
     if (!running_) return;
-    
     running_ = false;
     input_queue_.shutdown();
-    
     if (thread_.joinable()) {
         thread_.join();
     }
-    
-    std::cout << "[FP" << fp_id_ << "] Stopped (processed " 
-              << packets_processed_ << " packets)\n";
+    std::cout << "[FP" << fp_id_ << "] Stopped\n";
 }
 
 void FastPathProcessor::run() {
-    while (running_) {
-        // Get packet from input queue
-        auto job_opt = input_queue_.popWithTimeout(std::chrono::milliseconds(100));
+    auto last_cleanup = std::chrono::steady_clock::now();
+    
+    while (true) {
+        auto job_opt = input_queue_.popWithTimeout(
+            std::chrono::milliseconds(50),
+            &Profiler::instance().fp_pop_lock_ns,
+            &Profiler::instance().fp_idle_ns
+        );
         
-        if (!job_opt) {
-            // Periodically cleanup stale connections
-            conn_tracker_.cleanupStale(std::chrono::seconds(300));
-            continue;
+        if (job_opt) {
+            processPacket(*job_opt);
+        } else if (!running_ && input_queue_.empty()) {
+            // Shutting down and queue is fully drained
+            break;
         }
         
-        packets_processed_++;
-        
-        // Process the packet
-        PacketAction action = processPacket(*job_opt);
-        
-        // Call output callback
-        if (output_callback_) {
-            output_callback_(*job_opt, action);
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_cleanup > std::chrono::seconds(10)) {
+            connection_tracker_.cleanupStale();
+            last_cleanup = now;
         }
-        
-        // Update stats
-        if (action == PacketAction::DROP) {
-            packets_dropped_++;
+    }
+}
+
+void FastPathProcessor::processPacket(const PacketJob& job) {
+    stats_.total_processed++;
+    Profiler::instance().fp_packets++;
+    
+    Connection* conn = nullptr;
+    bool is_client = false;
+    
+    {
+        ScopedNsTimer t(Profiler::instance().fp_conn_lookup_ns);
+        const FlowKey* key_ptr = nullptr;
+        if (job.has_flow_key) {
+            key_ptr = &job.flow_key;
         } else {
-            packets_forwarded_++;
+            FlowKey fk = FlowKey::fromFiveTuple(job.tuple);
+            key_ptr = &fk;
+        }
+        
+        conn = connection_tracker_.getOrCreateConnection(*key_ptr);
+        
+        is_client = (conn->original_is_canonical) ?
+                         (key_ptr->canonical() == *key_ptr) :
+                         (key_ptr->canonical() != *key_ptr);
+        
+        connection_tracker_.updateConnection(conn, job.data.size(), is_client);
+        
+        if (job.tuple.protocol == 6) { // TCP
+            updateTCPState(conn, job.tcp_flags, is_client);
         }
     }
-}
-
-PacketAction FastPathProcessor::processPacket(PacketJob& job) {
-    // Get or create connection (keyed by canonical tuple)
-    Connection* conn = conn_tracker_.getOrCreateConnection(job.tuple);
-    if (!conn) {
-        // Should not happen, but handle gracefully
-        return PacketAction::FORWARD;
-    }
-
-    // Determine direction: is this packet client→server (in-bound)?
-    // The connection stores original_is_canonical to tell us which direction
-    // the creator packet was in.  For the current packet:
-    //   - if canonical(job.tuple) == job.tuple, it's the same direction as original
-    //   - otherwise it's the reverse
-    bool is_client_to_server = (job.tuple.canonical() == job.tuple)
-                                ? conn->original_is_canonical
-                                : !conn->original_is_canonical;
-
-    // Update connection stats with correct direction
-    conn_tracker_.updateConnection(conn, job.data.size(), is_client_to_server);
-
-    // Update TCP state if applicable
-    if (job.tuple.protocol == 6) {  // TCP
-        updateTCPState(conn, job.tcp_flags, is_client_to_server);
-    }
-
-    // If connection is already blocked, drop immediately
+    
     if (conn->state == ConnectionState::BLOCKED) {
-        return PacketAction::DROP;
-    }
-
-    // If connection not yet classified, try to inspect payload
-    if (conn->state != ConnectionState::CLASSIFIED && job.payload_length > 0) {
-        inspectPayload(job, conn);
-    }
-
-    // Check rules (even for classified connections, as rules might change)
-    return checkRules(job, conn);
-}
-
-void FastPathProcessor::inspectPayload(PacketJob& job, Connection* conn) {
-    if (job.payload_length == 0) {
+        ScopedNsTimer t(Profiler::instance().fp_handle_action_ns);
+        handleAction(job, PacketAction::DROP);
         return;
     }
-
-    // Fix (D9): Use getPayload() — never touches a moved-from vector
-    const uint8_t* payload = job.getPayload();
-    if (!payload) return;
-
-    // Try TLS SNI extraction first (most common for HTTPS)
-    if (tryExtractSNI(job, conn)) {
-        return;
-    }
-
-    // Try HTTP Host header extraction
-    if (tryExtractHTTPHost(job, conn)) {
-        return;
-    }
-
-    // Check for DNS (port 53)
-    if (job.tuple.dst_port == 53 || job.tuple.src_port == 53) {
-        auto domain = DNSExtractor::extractQuery(payload, job.payload_length);
-        if (domain) {
-            conn_tracker_.classifyConnection(conn, AppType::DNS, *domain);
+    
+    {
+        ScopedNsTimer t(Profiler::instance().fp_rule_check_ns);
+        if (rule_manager_->isIPBlocked(std::get<IPv4Addr>(conn->flow_key.src_addr)) ||
+            rule_manager_->isIPBlocked(std::get<IPv4Addr>(conn->flow_key.dst_addr))) {
+            connection_tracker_.blockConnection(conn);
+            handleAction(job, PacketAction::DROP);
             return;
         }
     }
-
-    // Basic port-based classification as fallback
-    if (job.tuple.dst_port == 80) {
-        conn_tracker_.classifyConnection(conn, AppType::HTTP, "");
-    } else if (job.tuple.dst_port == 443) {
-        conn_tracker_.classifyConnection(conn, AppType::HTTPS, "");
-    }
-}
-
-bool FastPathProcessor::tryExtractSNI(const PacketJob& job, Connection* conn) {
-    // Gate: attempt TLS SNI extraction on port 443, or on any large payload
-    // that might be TLS (the original condition `dst_port != 443 && payload < 50`
-    // was a logical bug — it skipped port-443 packets with short payloads but
-    // also skipped non-443 ports even with large payloads).
-    if (job.tuple.dst_port != 443 && job.payload_length < 50) {
-        return false;
-    }
-
-    // Fix (D9): use getPayload() — safe after move
-    const uint8_t* payload = job.getPayload();
-    if (!payload || job.payload_length == 0) {
-        return false;
-    }
-
-    auto sni = SNIExtractor::extract(payload, job.payload_length);
-    if (sni) {
-        sni_extractions_++;
-
-        // Map SNI to app type
-        AppType app = sniToAppType(*sni);
-        conn_tracker_.classifyConnection(conn, app, *sni);
-
-        if (app != AppType::UNKNOWN && app != AppType::HTTPS) {
-            classification_hits_++;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-bool FastPathProcessor::tryExtractHTTPHost(const PacketJob& job, Connection* conn) {
-    // Only for port 80 (HTTP)
-    if (job.tuple.dst_port != 80) {
-        return false;
-    }
-
-    // Fix (D9): use getPayload()
-    const uint8_t* payload = job.getPayload();
-    if (!payload || job.payload_length == 0) {
-        return false;
-    }
-
-    auto host = HTTPHostExtractor::extract(payload, job.payload_length);
-    if (host) {
-        AppType app = sniToAppType(*host);
-        conn_tracker_.classifyConnection(conn, app, *host);
-
-        if (app != AppType::UNKNOWN && app != AppType::HTTP) {
-            classification_hits_++;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-PacketAction FastPathProcessor::checkRules(const PacketJob& job, Connection* conn) {
-    if (!rule_manager_) {
-        return PacketAction::FORWARD;
+    
+    if (conn->state == ConnectionState::NEW || conn->state == ConnectionState::ESTABLISHED) {
+        ScopedNsTimer t(Profiler::instance().fp_inspect_ns);
+        inspectPayload(conn, job, is_client);
     }
     
-    // Parse source IP from tuple
-    uint32_t src_ip = job.tuple.src_ip;
-    
-    // Check blocking rules
-    auto block_reason = rule_manager_->shouldBlock(
-        src_ip,
-        job.tuple.dst_port,
-        conn->app_type,
-        conn->sni
-    );
-    
-    if (block_reason) {
-        // Log the block
-        std::ostringstream ss;
-        ss << "[FP" << fp_id_ << "] BLOCKED packet: ";
-        
-        switch (block_reason->type) {
-            case RuleManager::BlockReason::IP:
-                ss << "IP " << block_reason->detail;
-                break;
-            case RuleManager::BlockReason::APP:
-                ss << "App " << block_reason->detail;
-                break;
-            case RuleManager::BlockReason::DOMAIN:
-                ss << "Domain " << block_reason->detail;
-                break;
-            case RuleManager::BlockReason::PORT:
-                ss << "Port " << block_reason->detail;
-                break;
+    if (conn->state == ConnectionState::CLASSIFIED) {
+        ScopedNsTimer t(Profiler::instance().fp_rule_check_ns);
+        if (rule_manager_->isAppBlocked(conn->app_type)) {
+            connection_tracker_.blockConnection(conn);
+            handleAction(job, PacketAction::DROP);
+            return;
         }
         
-        std::cout << ss.str() << std::endl;
-        
-        // Mark connection as blocked
-        conn_tracker_.blockConnection(conn);
-        
-        return PacketAction::DROP;
+        const std::string& domain = conn->bestDomain();
+        if (!domain.empty() && rule_manager_->isDomainBlocked(domain)) {
+            connection_tracker_.blockConnection(conn);
+            handleAction(job, PacketAction::DROP);
+            return;
+        }
     }
     
-    return PacketAction::FORWARD;
+    {
+        ScopedNsTimer t(Profiler::instance().fp_handle_action_ns);
+        handleAction(job, PacketAction::FORWARD);
+    }
 }
 
-void FastPathProcessor::updateTCPState(Connection* conn,
-                                        uint8_t tcp_flags,
-                                        bool is_client_to_server) {
-    constexpr uint8_t SYN = 0x02;
-    constexpr uint8_t ACK = 0x10;
-    constexpr uint8_t FIN = 0x01;
-    constexpr uint8_t RST = 0x04;
-
-    // With flow canonicalization both directions arrive at this FP, so we
-    // can now observe the full 3-way handshake:
-    //   Client→Server SYN      : syn_seen = true
-    //   Server→Client SYN-ACK  : syn_ack_seen = true
-    //   Client→Server ACK      : state = ESTABLISHED
-
-    if (tcp_flags & SYN) {
-        if (tcp_flags & ACK) {
-            // SYN-ACK: should come from server (not client-to-server)
+void FastPathProcessor::updateTCPState(Connection* conn, uint8_t flags, bool is_client) {
+    if (flags & PacketAnalyzer::TCPFlags::SYN) {
+        if (flags & PacketAnalyzer::TCPFlags::ACK) {
             conn->syn_ack_seen = true;
+            if (conn->syn_seen) conn->state = ConnectionState::ESTABLISHED;
         } else {
-            // Pure SYN: should come from client (client-to-server)
             conn->syn_seen = true;
         }
-    }
-
-    // Complete handshake: SYN seen, SYN-ACK seen, now receiving plain ACK
-    if (conn->syn_seen && conn->syn_ack_seen &&
-        (tcp_flags & ACK) && !(tcp_flags & SYN)) {
-        if (conn->state == ConnectionState::NEW) {
-            conn->state = ConnectionState::ESTABLISHED;
-        }
-    }
-
-    if (tcp_flags & FIN) {
+    } else if (flags & PacketAnalyzer::TCPFlags::FIN) {
         conn->fin_seen = true;
+    } else if (flags & PacketAnalyzer::TCPFlags::RST) {
+        connection_tracker_.closeConnection(conn->flow_key);
+    }
+}
+
+void FastPathProcessor::inspectPayload(Connection* conn, const PacketJob& job, bool is_client) {
+    const uint8_t* payload = job.getPayload();
+    if (!payload) return;
+    
+    bool classification_updated = false;
+    std::string sni, http_host, dns_query;
+
+    if (conn->flow_key.protocol == 17) { // UDP
+        if (conn->flow_key.src_port == 53 || conn->flow_key.dst_port == 53) {
+            auto result = DNSExtractor::extractQuery(payload, job.payload_length);
+            if (result) {
+                dns_query = result->query_domain;
+                connection_tracker_.classifyConnection(conn, AppType::DNS, "", "", dns_query);
+                classification_updated = true;
+            }
+        } else if (QUICSNIExtractor::isQUICInitial(payload, job.payload_length)) {
+            auto result = QUICSNIExtractor::extract(payload, job.payload_length);
+            if (result) {
+                sni = *result;
+                connection_tracker_.classifyConnection(conn, sniToAppType(sni), sni);
+                classification_updated = true;
+            } else {
+                connection_tracker_.classifyConnection(conn, AppType::QUIC, "");
+                classification_updated = true;
+            }
+        }
+    } else if (conn->flow_key.protocol == 6 && is_client) { // TCP, client to server
+        if (conn->flow_key.src_port == 80 || conn->flow_key.dst_port == 80 || HTTPHostExtractor::isHTTPRequest(payload, job.payload_length)) {
+            auto host = HTTPHostExtractor::extract(payload, job.payload_length);
+            if (host) {
+                http_host = *host;
+                connection_tracker_.classifyConnection(conn, sniToAppType(http_host), "", http_host, "");
+                classification_updated = true;
+            } else {
+                connection_tracker_.classifyConnection(conn, AppType::HTTP, "");
+                classification_updated = true;
+            }
+        } else {
+            // TCP Reassembly for TLS (Client to Server)
+            auto result = conn->tcp_reassembler_client.tryExtractSNI(job.tcp_seq_number, payload, job.payload_length);
+            if (result) {
+                sni = *result;
+                connection_tracker_.classifyConnection(conn, sniToAppType(sni), sni);
+                classification_updated = true;
+                conn->tcp_reassembler_client.clear();
+            }
+        }
+    } else if (conn->flow_key.protocol == 6 && !is_client) {
+        // (Optional) Server to Client reassembly can be implemented here if needed for Server Hello
+        // auto result = conn->tcp_reassembler_server.tryExtractSNI(job.tcp_seq_number, payload, job.payload_length);
     }
 
-    if (tcp_flags & RST) {
-        conn->state = ConnectionState::CLOSED;
+    if (!classification_updated && (conn->packets_in + conn->packets_out > 10)) {
+        // If we still don't know what it is after 10 packets, just classify as unknown
+        connection_tracker_.classifyConnection(conn, AppType::UNKNOWN, "");
     }
+}
 
-    if (conn->fin_seen && (tcp_flags & ACK) && !(tcp_flags & SYN)) {
-        conn->state = ConnectionState::CLOSED;
+void FastPathProcessor::handleAction(const PacketJob& job, PacketAction action) {
+    if (action == PacketAction::DROP) {
+        stats_.total_dropped++;
+    } else {
+        stats_.total_forwarded++;
     }
-
-    // Suppress unused parameter warning (direction used for documentation)
-    (void)is_client_to_server;
+    
+    if (output_cb_) {
+        output_cb_(job, action);
+    }
 }
 
 FastPathProcessor::FPStats FastPathProcessor::getStats() const {
-    FPStats stats;
-    stats.packets_processed = packets_processed_.load();
-    stats.packets_forwarded = packets_forwarded_.load();
-    stats.packets_dropped = packets_dropped_.load();
-    stats.connections_tracked = conn_tracker_.getActiveCount();
-    stats.sni_extractions = sni_extractions_.load();
-    stats.classification_hits = classification_hits_.load();
-    return stats;
+    FPStats current = stats_;
+    current.total_connections = connection_tracker_.getActiveCount();
+    return current;
+}
+
+std::string FastPathProcessor::generateClassificationReport() const {
+    auto stats = connection_tracker_.getStats();
+    std::ostringstream ss;
+    ss << "FP" << fp_id_ << " Report:\n"
+       << "  Active: " << stats.active_connections << "\n"
+       << "  Total:  " << stats.total_connections_seen << "\n"
+       << "  Classified: " << stats.classified_connections << "\n"
+       << "  Blocked: " << stats.blocked_connections << "\n";
+    return ss.str();
 }
 
 // ============================================================================
 // FPManager Implementation
 // ============================================================================
 
-FPManager::FPManager(int num_fps,
-                     RuleManager* rule_manager,
-                     PacketOutputCallback output_callback) {
+FPManager::FPManager(int num_fps, RuleManager* rule_manager, OutputCallback output_cb)
+    : rule_manager_(rule_manager), output_cb_(std::move(output_cb)) {
     
-    // Create FP processors (each has its own input queue)
     for (int i = 0; i < num_fps; i++) {
-        auto fp = std::make_unique<FastPathProcessor>(i, rule_manager, output_callback);
-        fps_.push_back(std::move(fp));
+        fps_.push_back(std::make_unique<FastPathProcessor>(i, rule_manager_, output_cb_));
     }
     
-    std::cout << "[FPManager] Created " << num_fps << " fast path processors\n";
+    std::cout << "[FPManager] Created " << num_fps << " FP threads\n";
 }
 
 FPManager::~FPManager() {
@@ -345,10 +265,22 @@ void FPManager::startAll() {
 }
 
 void FPManager::stopAll() {
-    // Stop all FPs (they'll shutdown their own queues)
     for (auto& fp : fps_) {
         fp->stop();
     }
+}
+
+FastPathProcessor& FPManager::getFP(int id) {
+    return *fps_[id];
+}
+
+std::vector<ThreadSafeQueue<PacketJob>*> FPManager::getQueuePtrs() {
+    std::vector<ThreadSafeQueue<PacketJob>*> ptrs;
+    ptrs.reserve(fps_.size());
+    for (auto& fp : fps_) {
+        ptrs.push_back(&fp->getInputQueue());
+    }
+    return ptrs;
 }
 
 FPManager::AggregatedStats FPManager::getAggregatedStats() const {
@@ -356,78 +288,20 @@ FPManager::AggregatedStats FPManager::getAggregatedStats() const {
     
     for (const auto& fp : fps_) {
         auto fp_stats = fp->getStats();
-        stats.total_processed += fp_stats.packets_processed;
-        stats.total_forwarded += fp_stats.packets_forwarded;
-        stats.total_dropped += fp_stats.packets_dropped;
-        stats.total_connections += fp_stats.connections_tracked;
+        stats.total_processed += fp_stats.total_processed;
+        stats.total_forwarded += fp_stats.total_forwarded;
+        stats.total_dropped += fp_stats.total_dropped;
+        stats.total_connections += fp_stats.total_connections;
     }
     
     return stats;
 }
 
 std::string FPManager::generateClassificationReport() const {
-    // Aggregate app distribution across all FPs
-    std::unordered_map<AppType, size_t> app_counts;
-    std::unordered_map<std::string, size_t> domain_counts;
-    size_t total_classified = 0;
-    size_t total_unknown = 0;
-    
-    for (const auto& fp : fps_) {
-        fp->getConnectionTracker().forEach([&](const Connection& conn) {
-            app_counts[conn.app_type]++;
-            
-            if (conn.app_type == AppType::UNKNOWN) {
-                total_unknown++;
-            } else {
-                total_classified++;
-            }
-            
-            if (!conn.sni.empty()) {
-                domain_counts[conn.sni]++;
-            }
-        });
-    }
-    
     std::ostringstream ss;
-    ss << "\n╔══════════════════════════════════════════════════════════════╗\n";
-    ss << "║                 APPLICATION CLASSIFICATION REPORT             ║\n";
-    ss << "╠══════════════════════════════════════════════════════════════╣\n";
-    
-    size_t total = total_classified + total_unknown;
-    double classified_pct = total > 0 ? (100.0 * total_classified / total) : 0;
-    double unknown_pct = total > 0 ? (100.0 * total_unknown / total) : 0;
-    
-    ss << "║ Total Connections:    " << std::setw(10) << total << "                           ║\n";
-    ss << "║ Classified:           " << std::setw(10) << total_classified 
-       << " (" << std::fixed << std::setprecision(1) << classified_pct << "%)                  ║\n";
-    ss << "║ Unidentified:         " << std::setw(10) << total_unknown
-       << " (" << std::fixed << std::setprecision(1) << unknown_pct << "%)                  ║\n";
-    
-    ss << "╠══════════════════════════════════════════════════════════════╣\n";
-    ss << "║                    APPLICATION DISTRIBUTION                   ║\n";
-    ss << "╠══════════════════════════════════════════════════════════════╣\n";
-    
-    // Sort apps by count
-    std::vector<std::pair<AppType, size_t>> sorted_apps(
-        app_counts.begin(), app_counts.end());
-    std::sort(sorted_apps.begin(), sorted_apps.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-    
-    for (const auto& pair : sorted_apps) {
-        double pct = total > 0 ? (100.0 * pair.second / total) : 0;
-        
-        // Create a simple bar graph
-        int bar_len = static_cast<int>(pct / 5);  // 20 chars max
-        std::string bar(bar_len, '#');
-        
-        ss << "║ " << std::setw(15) << std::left << appTypeToString(pair.first)
-           << std::setw(8) << std::right << pair.second
-           << " " << std::setw(5) << std::fixed << std::setprecision(1) << pct << "% "
-           << std::setw(20) << std::left << bar << "   ║\n";
+    for (const auto& fp : fps_) {
+        ss << fp->generateClassificationReport();
     }
-    
-    ss << "╚══════════════════════════════════════════════════════════════╝\n";
-    
     return ss.str();
 }
 

@@ -1,0 +1,30 @@
+name: Manual Performance Benchmark Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      packets:
+        description: 'Number of synthetic packets to benchmark (e.g. 100000 or 1000000)'
+        required: true
+        default: '100000'
+
+jobs:
+  benchmark:
+    name: Run Synthetic Benchmark (${{ inputs.packets }} Packets)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Targets
+        run: cmake --build build --config Release
+
+      - name: Execute Correctness Suite
+        run: ./build/dpi_tests
+
+      - name: Execute DPI Benchmark
+        run: ./build/dpi_benchmark --packets ${{ inputs.packets }}

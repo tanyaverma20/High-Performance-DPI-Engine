@@ -5,44 +5,14 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include <chrono>
+#include "types.h"
 
 namespace DPI {
 
 // ============================================================================
 // SNI Extractor - Parses TLS Client Hello to extract Server Name Indication
 // ============================================================================
-// 
-// TLS Client Hello Structure (simplified):
-// 
-// Record Layer:
-//   - Content Type (1 byte): 0x16 = Handshake
-//   - Version (2 bytes): 0x0301 = TLS 1.0, 0x0303 = TLS 1.2
-//   - Length (2 bytes)
-//
-// Handshake Layer:
-//   - Handshake Type (1 byte): 0x01 = Client Hello
-//   - Length (3 bytes)
-//   - Client Version (2 bytes)
-//   - Random (32 bytes)
-//   - Session ID Length (1 byte)
-//   - Session ID (variable)
-//   - Cipher Suites Length (2 bytes)
-//   - Cipher Suites (variable)
-//   - Compression Methods Length (1 byte)
-//   - Compression Methods (variable)
-//   - Extensions Length (2 bytes)
-//   - Extensions (variable)
-//
-// SNI Extension (type 0x0000):
-//   - Extension Type (2 bytes): 0x0000
-//   - Extension Length (2 bytes)
-//   - SNI List Length (2 bytes)
-//   - SNI Type (1 byte): 0x00 = hostname
-//   - SNI Length (2 bytes)
-//   - SNI Value (variable): The hostname!
-//
-// ============================================================================
-
 class SNIExtractor {
 public:
     // Extract SNI from a TLS Client Hello packet
@@ -57,13 +27,11 @@ public:
         const uint8_t* payload, size_t length);
 
 private:
-    // TLS Constants
     static constexpr uint8_t CONTENT_TYPE_HANDSHAKE = 0x16;
     static constexpr uint8_t HANDSHAKE_CLIENT_HELLO = 0x01;
     static constexpr uint16_t EXTENSION_SNI = 0x0000;
     static constexpr uint8_t SNI_TYPE_HOSTNAME = 0x00;
     
-    // Helper to read big-endian values
     static uint16_t readUint16BE(const uint8_t* data);
     static uint32_t readUint24BE(const uint8_t* data);
 };
@@ -73,11 +41,7 @@ private:
 // ============================================================================
 class QUICSNIExtractor {
 public:
-    // QUIC Initial packets also contain TLS Client Hello (in CRYPTO frames)
-    // This is more complex as QUIC has its own framing
     static std::optional<std::string> extract(const uint8_t* payload, size_t length);
-    
-    // Check if this looks like a QUIC Initial packet
     static bool isQUICInitial(const uint8_t* payload, size_t length);
 };
 
@@ -86,24 +50,34 @@ public:
 // ============================================================================
 class HTTPHostExtractor {
 public:
-    // Extract Host header from HTTP request
     static std::optional<std::string> extract(const uint8_t* payload, size_t length);
-    
-    // Check if this looks like an HTTP request
     static bool isHTTPRequest(const uint8_t* payload, size_t length);
 };
 
 // ============================================================================
-// DNS Query Extractor (to correlate domain names)
+// DNS Query Extractor
 // ============================================================================
+struct DnsResult {
+    uint16_t transaction_id = 0;
+    uint16_t flags = 0;
+    uint16_t question_count = 0;
+    uint16_t answer_count = 0;
+    std::string query_domain;
+};
+
 class DNSExtractor {
 public:
-    // Extract queried domain from DNS request
-    static std::optional<std::string> extractQuery(const uint8_t* payload, size_t length);
+    // Safely extract DNS query details, handling compression pointers
+    static std::optional<DnsResult> extractQuery(const uint8_t* payload, size_t length);
     
-    // Check if this is a DNS query (not response)
     static bool isDNSQuery(const uint8_t* payload, size_t length);
+    
+private:
+    // Helper to safely read a domain name handling compression pointers
+    static bool readDomainName(const uint8_t* payload, size_t length, size_t& offset, std::string& domain);
 };
+
+// TCPReassembler has been moved to tcp_reassembler.h
 
 } // namespace DPI
 

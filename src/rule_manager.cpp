@@ -49,9 +49,11 @@ bool RuleManager::isIPBlocked(uint32_t ip) const {
 std::vector<std::string> RuleManager::getBlockedIPs() const {
     std::shared_lock<std::shared_mutex> lock(ip_mutex_);
     std::vector<std::string> result;
+
     for (uint32_t ip : blocked_ips_) {
         result.push_back(ipToString(ip));
     }
+
     return result;
 }
 
@@ -62,13 +64,15 @@ std::vector<std::string> RuleManager::getBlockedIPs() const {
 void RuleManager::blockApp(AppType app) {
     std::unique_lock<std::shared_mutex> lock(app_mutex_);
     blocked_apps_.insert(app);
-    std::cout << "[RuleManager] Blocked app: " << appTypeToString(app) << std::endl;
+    std::cout << "[RuleManager] Blocked app: "
+              << appTypeToString(app) << std::endl;
 }
 
 void RuleManager::unblockApp(AppType app) {
     std::unique_lock<std::shared_mutex> lock(app_mutex_);
     blocked_apps_.erase(app);
-    std::cout << "[RuleManager] Unblocked app: " << appTypeToString(app) << std::endl;
+    std::cout << "[RuleManager] Unblocked app: "
+              << appTypeToString(app) << std::endl;
 }
 
 bool RuleManager::isAppBlocked(AppType app) const {
@@ -78,7 +82,10 @@ bool RuleManager::isAppBlocked(AppType app) const {
 
 std::vector<AppType> RuleManager::getBlockedApps() const {
     std::shared_lock<std::shared_mutex> lock(app_mutex_);
-    return std::vector<AppType>(blocked_apps_.begin(), blocked_apps_.end());
+    return std::vector<AppType>(
+        blocked_apps_.begin(),
+        blocked_apps_.end()
+    );
 }
 
 // ============================================================================
@@ -87,89 +94,189 @@ std::vector<AppType> RuleManager::getBlockedApps() const {
 
 void RuleManager::blockDomain(const std::string& domain) {
     std::unique_lock<std::shared_mutex> lock(domain_mutex_);
-    
-    if (domain.find('*') != std::string::npos) {
-        domain_patterns_.push_back(domain);
-    } else {
-        blocked_domains_.insert(domain);
+
+    // Normalize domain to lowercase so rules are case-insensitive.
+    std::string normalized_domain = domain;
+
+    std::transform(
+        normalized_domain.begin(),
+        normalized_domain.end(),
+        normalized_domain.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
+
+    // Remove trailing dot from FQDN notation.
+    if (!normalized_domain.empty() &&
+        normalized_domain.back() == '.') {
+        normalized_domain.pop_back();
     }
-    
-    std::cout << "[RuleManager] Blocked domain: " << domain << std::endl;
+
+    // Preserve wildcard rules while storing them in normalized form.
+    if (normalized_domain.find('*') != std::string::npos) {
+        domain_patterns_.push_back(normalized_domain);
+    } else {
+        blocked_domains_.insert(normalized_domain);
+    }
+
+    std::cout << "[RuleManager] Blocked domain: "
+              << normalized_domain << std::endl;
 }
 
 void RuleManager::unblockDomain(const std::string& domain) {
     std::unique_lock<std::shared_mutex> lock(domain_mutex_);
-    
-    if (domain.find('*') != std::string::npos) {
-        auto it = std::find(domain_patterns_.begin(), domain_patterns_.end(), domain);
+
+    // Normalize the domain exactly the same way as blockDomain().
+    std::string normalized_domain = domain;
+
+    std::transform(
+        normalized_domain.begin(),
+        normalized_domain.end(),
+        normalized_domain.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
+
+    // Remove trailing dot from FQDN notation.
+    if (!normalized_domain.empty() &&
+        normalized_domain.back() == '.') {
+        normalized_domain.pop_back();
+    }
+
+    if (normalized_domain.find('*') != std::string::npos) {
+        auto it = std::find(
+            domain_patterns_.begin(),
+            domain_patterns_.end(),
+            normalized_domain
+        );
+
         if (it != domain_patterns_.end()) {
             domain_patterns_.erase(it);
         }
     } else {
-        blocked_domains_.erase(domain);
+        blocked_domains_.erase(normalized_domain);
     }
-    
-    std::cout << "[RuleManager] Unblocked domain: " << domain << std::endl;
+
+    std::cout << "[RuleManager] Unblocked domain: "
+              << normalized_domain << std::endl;
 }
 
-bool RuleManager::domainMatchesPattern(const std::string& domain, const std::string& pattern) {
-    // Handle *.example.com pattern
-    if (pattern.size() >= 2 && pattern[0] == '*' && pattern[1] == '.') {
-        std::string suffix = pattern.substr(1);  // .example.com
-        
-        // Check if domain ends with the pattern
+bool RuleManager::domainMatchesPattern(
+    const std::string& domain,
+    const std::string& pattern) {
+
+    // Handle *.example.com pattern.
+    if (pattern.size() >= 2 &&
+        pattern[0] == '*' &&
+        pattern[1] == '.') {
+
+        std::string suffix = pattern.substr(1); // .example.com
+
+        // Check whether domain ends with the suffix.
         if (domain.size() >= suffix.size() &&
-            domain.compare(domain.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            domain.compare(
+                domain.size() - suffix.size(),
+                suffix.size(),
+                suffix
+            ) == 0) {
+
             return true;
         }
-        
-        // Also match the bare domain (example.com matches *.example.com)
+
+        // Also match the bare domain.
+        // example.com matches *.example.com.
         if (domain == pattern.substr(2)) {
             return true;
         }
     }
-    
+
     return false;
 }
 
 bool RuleManager::isDomainBlocked(const std::string& domain) const {
-    if (domain.empty()) return false;
+    if (domain.empty()) {
+        return false;
+    }
 
-    // Normalize once OUTSIDE the lock — avoids allocation inside the read-lock.
+    // Normalize incoming domain to lowercase.
+    // This keeps domain matching case-insensitive.
     std::string lower_domain = domain;
-    std::transform(lower_domain.begin(), lower_domain.end(), lower_domain.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    // Strip trailing dot (FQDN notation)
-    if (!lower_domain.empty() && lower_domain.back() == '.') {
+
+    std::transform(
+        lower_domain.begin(),
+        lower_domain.end(),
+        lower_domain.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
+
+    // Strip trailing dot from FQDN notation.
+    if (!lower_domain.empty() &&
+        lower_domain.back() == '.') {
         lower_domain.pop_back();
     }
 
     std::shared_lock<std::shared_mutex> lock(domain_mutex_);
 
-    // 1. Exact match against the normalized blocked set
+    // ------------------------------------------------------------------------
+    // 1. Exact match
+    // ------------------------------------------------------------------------
+
     if (blocked_domains_.count(lower_domain) > 0) {
         return true;
     }
 
-    // 2. Subdomain-of-exact-domain check (D6 fix):
-    //    blockDomain("evil.com") must also block "www.evil.com", "api.evil.com".
-    //    We check that lower_domain ends with "." + blocked_entry, ensuring a
-    //    dot-label boundary so "notevil.com" is NOT matched.
+    // ------------------------------------------------------------------------
+    // 2. Subdomain-of-exact-domain matching
+    //
+    // blockDomain("evil.com") must block:
+    //   evil.com
+    //   www.evil.com
+    //   api.evil.com
+    //   deep.api.evil.com
+    //
+    // But must NOT block:
+    //   notevil.com
+    //   prefixevil.com
+    // ------------------------------------------------------------------------
+
     for (const auto& entry : blocked_domains_) {
         if (lower_domain.size() > entry.size() + 1) {
-            size_t dot_pos = lower_domain.size() - entry.size() - 1;
+            size_t dot_pos =
+                lower_domain.size() - entry.size() - 1;
+
             if (lower_domain[dot_pos] == '.' &&
-                lower_domain.compare(dot_pos + 1, entry.size(), entry) == 0) {
-                return true;  // e.g. "www.evil.com" ends with ".evil.com"
+                lower_domain.compare(
+                    dot_pos + 1,
+                    entry.size(),
+                    entry
+                ) == 0) {
+
+                return true;
             }
         }
     }
 
-    // 3. Wildcard pattern match (existing behaviour preserved)
+    // ------------------------------------------------------------------------
+    // 3. Wildcard pattern matching
+    // ------------------------------------------------------------------------
+
     for (const auto& pattern : domain_patterns_) {
+        // Patterns are normalized when inserted, but normalize again
+        // defensively in case older persisted rules contain uppercase text.
         std::string lower_pattern = pattern;
-        std::transform(lower_pattern.begin(), lower_pattern.end(), lower_pattern.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+
+        std::transform(
+            lower_pattern.begin(),
+            lower_pattern.end(),
+            lower_pattern.begin(),
+            [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            }
+        );
 
         if (domainMatchesPattern(lower_domain, lower_pattern)) {
             return true;
@@ -181,8 +288,18 @@ bool RuleManager::isDomainBlocked(const std::string& domain) const {
 
 std::vector<std::string> RuleManager::getBlockedDomains() const {
     std::shared_lock<std::shared_mutex> lock(domain_mutex_);
-    std::vector<std::string> result(blocked_domains_.begin(), blocked_domains_.end());
-    result.insert(result.end(), domain_patterns_.begin(), domain_patterns_.end());
+
+    std::vector<std::string> result(
+        blocked_domains_.begin(),
+        blocked_domains_.end()
+    );
+
+    result.insert(
+        result.end(),
+        domain_patterns_.begin(),
+        domain_patterns_.end()
+    );
+
     return result;
 }
 
@@ -193,7 +310,8 @@ std::vector<std::string> RuleManager::getBlockedDomains() const {
 void RuleManager::blockPort(uint16_t port) {
     std::unique_lock<std::shared_mutex> lock(port_mutex_);
     blocked_ports_.insert(port);
-    std::cout << "[RuleManager] Blocked port: " << port << std::endl;
+    std::cout << "[RuleManager] Blocked port: "
+              << port << std::endl;
 }
 
 void RuleManager::unblockPort(uint16_t port) {
@@ -215,27 +333,39 @@ std::optional<RuleManager::BlockReason> RuleManager::shouldBlock(
     uint16_t dst_port,
     AppType app,
     const std::string& domain) const {
-    
-    // Check IP first (most specific)
+
+    // Check IP first (most specific).
     if (isIPBlocked(src_ip)) {
-        return BlockReason{BlockReason::IP, ipToString(src_ip)};
+        return BlockReason{
+            BlockReason::IP,
+            ipToString(src_ip)
+        };
     }
-    
-    // Check port
+
+    // Check port.
     if (isPortBlocked(dst_port)) {
-        return BlockReason{BlockReason::PORT, std::to_string(dst_port)};
+        return BlockReason{
+            BlockReason::PORT,
+            std::to_string(dst_port)
+        };
     }
-    
-    // Check app
+
+    // Check application.
     if (isAppBlocked(app)) {
-        return BlockReason{BlockReason::APP, appTypeToString(app)};
+        return BlockReason{
+            BlockReason::APP,
+            appTypeToString(app)
+        };
     }
-    
-    // Check domain
+
+    // Check domain.
     if (!domain.empty() && isDomainBlocked(domain)) {
-        return BlockReason{BlockReason::DOMAIN, domain};
+        return BlockReason{
+            BlockReason::DOMAIN,
+            domain
+        };
     }
-    
+
     return std::nullopt;
 }
 
@@ -245,125 +375,177 @@ std::optional<RuleManager::BlockReason> RuleManager::shouldBlock(
 
 bool RuleManager::saveRules(const std::string& filename) const {
     std::ofstream file(filename);
+
     if (!file.is_open()) {
         return false;
     }
-    
-    // Save blocked IPs
+
+    // Save blocked IPs.
     file << "[BLOCKED_IPS]\n";
+
     for (const auto& ip : getBlockedIPs()) {
         file << ip << "\n";
     }
-    
-    // Save blocked apps
+
+    // Save blocked apps.
     file << "\n[BLOCKED_APPS]\n";
+
     for (const auto& app : getBlockedApps()) {
         file << appTypeToString(app) << "\n";
     }
-    
-    // Save blocked domains
+
+    // Save blocked domains.
     file << "\n[BLOCKED_DOMAINS]\n";
+
     for (const auto& domain : getBlockedDomains()) {
         file << domain << "\n";
     }
-    
-    // Save blocked ports
+
+    // Save blocked ports.
     file << "\n[BLOCKED_PORTS]\n";
     {
         std::shared_lock<std::shared_mutex> lock(port_mutex_);
+
         for (uint16_t port : blocked_ports_) {
             file << port << "\n";
         }
     }
-    
+
     file.close();
-    std::cout << "[RuleManager] Rules saved to: " << filename << std::endl;
+
+    std::cout << "[RuleManager] Rules saved to: "
+              << filename << std::endl;
+
     return true;
 }
 
 bool RuleManager::loadRules(const std::string& filename) {
     std::ifstream file(filename);
+
     if (!file.is_open()) {
         return false;
     }
-    
+
     std::string line;
     std::string current_section;
-    
+
     while (std::getline(file, line)) {
-        // Skip empty lines
-        if (line.empty()) continue;
-        
-        // Check for section headers
+
+        // Skip empty lines.
+        if (line.empty()) {
+            continue;
+        }
+
+        // Check for section headers.
         if (line[0] == '[') {
             current_section = line;
             continue;
         }
-        
-        // Process based on section
+
+        // Process based on section.
         if (current_section == "[BLOCKED_IPS]") {
+
             blockIP(line);
+
         } else if (current_section == "[BLOCKED_APPS]") {
-            // Convert string back to AppType
-            for (int i = 0; i < static_cast<int>(AppType::APP_COUNT); i++) {
-                if (appTypeToString(static_cast<AppType>(i)) == line) {
+
+            // Convert string back to AppType.
+            for (int i = 0;
+                 i < static_cast<int>(AppType::APP_COUNT);
+                 i++) {
+
+                if (appTypeToString(
+                        static_cast<AppType>(i)
+                    ) == line) {
+
                     blockApp(static_cast<AppType>(i));
                     break;
                 }
             }
+
         } else if (current_section == "[BLOCKED_DOMAINS]") {
+
+            // blockDomain() performs normalization.
             blockDomain(line);
+
         } else if (current_section == "[BLOCKED_PORTS]") {
-            blockPort(static_cast<uint16_t>(std::stoi(line)));
+
+            blockPort(
+                static_cast<uint16_t>(
+                    std::stoi(line)
+                )
+            );
         }
     }
-    
+
     file.close();
-    std::cout << "[RuleManager] Rules loaded from: " << filename << std::endl;
+
+    std::cout << "[RuleManager] Rules loaded from: "
+              << filename << std::endl;
+
     return true;
 }
 
+// ============================================================================
+// Clear Rules
+// ============================================================================
+
 void RuleManager::clearAll() {
+
     {
         std::unique_lock<std::shared_mutex> lock(ip_mutex_);
         blocked_ips_.clear();
     }
+
     {
         std::unique_lock<std::shared_mutex> lock(app_mutex_);
         blocked_apps_.clear();
     }
+
     {
         std::unique_lock<std::shared_mutex> lock(domain_mutex_);
         blocked_domains_.clear();
         domain_patterns_.clear();
     }
+
     {
         std::unique_lock<std::shared_mutex> lock(port_mutex_);
         blocked_ports_.clear();
     }
-    std::cout << "[RuleManager] All rules cleared" << std::endl;
+
+    std::cout << "[RuleManager] All rules cleared"
+              << std::endl;
 }
+
+// ============================================================================
+// Statistics
+// ============================================================================
 
 RuleManager::RuleStats RuleManager::getStats() const {
     RuleStats stats;
-    
+
     {
         std::shared_lock<std::shared_mutex> lock(ip_mutex_);
         stats.blocked_ips = blocked_ips_.size();
     }
+
     {
         std::shared_lock<std::shared_mutex> lock(app_mutex_);
         stats.blocked_apps = blocked_apps_.size();
     }
+
     {
         std::shared_lock<std::shared_mutex> lock(domain_mutex_);
-        stats.blocked_domains = blocked_domains_.size() + domain_patterns_.size();
+        stats.blocked_domains =
+            blocked_domains_.size() +
+            domain_patterns_.size();
     }
+
     {
         std::shared_lock<std::shared_mutex> lock(port_mutex_);
         stats.blocked_ports = blocked_ports_.size();
     }
-    
+
     return stats;
 }
 

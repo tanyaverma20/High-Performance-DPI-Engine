@@ -1,9 +1,13 @@
 # Build
 build/
+build_direct/
 cmake-build-*/
 *.o
 *.obj
 *.exe
+dpi_engine
+dpi_tests
+dpi_benchmark
 
 # IDE
 .vscode/

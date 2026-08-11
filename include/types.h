@@ -9,11 +9,14 @@
 #include <atomic>
 #include <optional>
 #include <cstring>   // memcpy
+#include <variant>
+#include "ipv6_utils.h"
+#include "tcp_reassembler.h"
 
 namespace DPI {
 
 // ============================================================================
-// Five-Tuple: Uniquely identifies a connection/flow
+// Five-Tuple: Uniquely identifies a connection/flow (IPv4 only)
 // ============================================================================
 struct FiveTuple {
     uint32_t src_ip;
@@ -30,20 +33,10 @@ struct FiveTuple {
                protocol == other.protocol;
     }
 
-    // Create reverse tuple (server→client direction)
     FiveTuple reverse() const {
         return {dst_ip, src_ip, dst_port, src_port, protocol};
     }
 
-    // ---------------------------------------------------------------------------
-    // canonical() — direction-independent representation
-    //
-    // Both A→B and B→A return the same canonical FiveTuple so that hashing and
-    // flow-table lookup are direction-agnostic.  We define "canonical" as the
-    // ordering where (src_ip, src_port) <= (dst_ip, dst_port) lexicographically.
-    //
-    // Invariant: canonical(A→B) == canonical(B→A)
-    // ---------------------------------------------------------------------------
     FiveTuple canonical() const {
         bool already_canonical =
             (src_ip < dst_ip) ||
@@ -54,23 +47,11 @@ struct FiveTuple {
     std::string toString() const;
 };
 
-// ============================================================================
-// Hash function for FiveTuple — hashes the CANONICAL form so that both
-// directions of the same flow produce the same hash value and select the same
-// worker thread.
-//
-// Fix (D9/E1): previously hashed the raw tuple, causing A→B and B→A to hash
-// to different values and be dispatched to different FP workers.
-// ============================================================================
 struct FiveTupleHash {
     size_t operator()(const FiveTuple& tuple) const {
-        // Always hash the canonical form — direction-independent
         FiveTuple c = tuple.canonical();
-
         size_t h = 0;
-        auto mix = [&](size_t v) {
-            h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2);
-        };
+        auto mix = [&](size_t v) { h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2); };
         mix(std::hash<uint32_t>{}(c.src_ip));
         mix(std::hash<uint32_t>{}(c.dst_ip));
         mix(std::hash<uint16_t>{}(c.src_port));
@@ -80,9 +61,50 @@ struct FiveTupleHash {
     }
 };
 
-// ============================================================================
-// Application Classification
-// ============================================================================
+using IPv4Addr = uint32_t;
+using IPAddress = std::variant<IPv4Addr, IPv6Address>;
+
+struct FlowKey {
+    IPAddress src_addr;
+    IPAddress dst_addr;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t protocol;
+
+    bool isIPv6() const { return src_addr.index() == 1; }
+
+    static FlowKey fromFiveTuple(const FiveTuple& t) {
+        return { t.src_ip, t.dst_ip, t.src_port, t.dst_port, t.protocol };
+    }
+
+    static FlowKey fromIPv6(const IPv6Address& src, const IPv6Address& dst, uint16_t sport, uint16_t dport, uint8_t proto) {
+        return { src, dst, sport, dport, proto };
+    }
+
+    bool operator==(const FlowKey& o) const {
+        return src_addr == o.src_addr &&
+               dst_addr == o.dst_addr &&
+               src_port == o.src_port &&
+               dst_port == o.dst_port &&
+               protocol == o.protocol;
+    }
+    
+    bool operator!=(const FlowKey& o) const {
+        return !(*this == o);
+    }
+
+    FlowKey reverse() const {
+        return { dst_addr, src_addr, dst_port, src_port, protocol };
+    }
+
+    FlowKey canonical() const;
+    std::string toString() const;
+};
+
+struct FlowKeyHash {
+    size_t operator()(const FlowKey& key) const;
+};
+
 enum class AppType {
     UNKNOWN = 0,
     HTTP,
@@ -90,7 +112,6 @@ enum class AppType {
     DNS,
     TLS,
     QUIC,
-    // Specific applications (detected via SNI)
     GOOGLE,
     FACEBOOK,
     YOUTUBE,
@@ -108,16 +129,12 @@ enum class AppType {
     DISCORD,
     GITHUB,
     CLOUDFLARE,
-    // Add more as needed
-    APP_COUNT  // Keep this last for counting
+    APP_COUNT
 };
 
 std::string appTypeToString(AppType type);
 AppType sniToAppType(const std::string& sni);
 
-// ============================================================================
-// Connection State
-// ============================================================================
 enum class ConnectionState {
     NEW,
     ESTABLISHED,
@@ -126,35 +143,27 @@ enum class ConnectionState {
     CLOSED
 };
 
-// ============================================================================
-// Packet Action (what to do with the packet)
-// ============================================================================
 enum class PacketAction {
-    FORWARD,    // Send to internet
-    DROP,       // Block/drop the packet
-    INSPECT,    // Needs further inspection
-    LOG_ONLY    // Forward but log
+    FORWARD,
+    DROP,
+    INSPECT,
+    LOG_ONLY
 };
 
-// ============================================================================
-// Connection Entry (tracked per flow)
-//
-// The flow is keyed by the CANONICAL five-tuple (direction-independent).
-// The original_direction_is_canonical flag records whether the packet that
-// created this connection was already in canonical form (i.e. was the
-// initiating/client direction).  This is needed to correctly attribute
-// directional byte counters and TCP handshake flags.
-// ============================================================================
 struct Connection {
-    FiveTuple tuple;                   // Canonical (direction-independent) key
-    bool original_is_canonical = true; // true = creator packet was client→server
+    FlowKey flow_key;
+    bool has_flow_key = false;
+    FiveTuple tuple;
+    bool original_is_canonical = true;
 
     ConnectionState state = ConnectionState::NEW;
     AppType app_type = AppType::UNKNOWN;
-    std::string sni;  // Server Name Indication (if detected)
+    std::string sni;
+    std::string http_host;
+    std::string dns_query;
 
-    uint64_t packets_in  = 0;  // client→server
-    uint64_t packets_out = 0;  // server→client
+    uint64_t packets_in  = 0;
+    uint64_t packets_out = 0;
     uint64_t bytes_in    = 0;
     uint64_t bytes_out   = 0;
 
@@ -163,25 +172,29 @@ struct Connection {
 
     PacketAction action = PacketAction::FORWARD;
 
-    // For TCP state tracking
     bool syn_seen     = false;
     bool syn_ack_seen = false;
     bool fin_seen     = false;
+
+    // Per-flow direction-specific TCP reassembly (max 16KB each)
+    TCPReassembler tcp_reassembler_client;
+    TCPReassembler tcp_reassembler_server;
+
+    std::string bestDomain() const {
+        if (!sni.empty()) return sni;
+        if (!http_host.empty()) return http_host;
+        if (!dns_query.empty()) return dns_query;
+        return "";
+    }
 };
 
-// ============================================================================
-// Packet wrapper for queue passing
-//
-// Fix (D9): payload_data raw pointer has been removed.  It was set to
-// data.data() + payload_offset at job-creation time, but after a std::move the
-// vector is emptied and the pointer becomes dangling.
-//
-// Instead, call getPayload() which computes data.data() + payload_offset each
-// time, always from the live vector.  Returns nullptr if out of bounds.
-// ============================================================================
 struct PacketJob {
     uint32_t packet_id = 0;
     FiveTuple tuple;
+    FlowKey flow_key;
+    bool has_flow_key = false;
+    uint32_t tcp_seq_number = 0;
+
     std::vector<uint8_t> data;
     size_t eth_offset       = 0;
     size_t ip_offset        = 0;
@@ -190,12 +203,9 @@ struct PacketJob {
     size_t payload_length   = 0;
     uint8_t tcp_flags       = 0;
 
-    // Timestamps
     uint32_t ts_sec  = 0;
     uint32_t ts_usec = 0;
 
-    // Safe payload accessor — never returns a dangling pointer.
-    // Returns nullptr if there is no payload or offset is out of bounds.
     const uint8_t* getPayload() const {
         if (payload_length == 0 || payload_offset >= data.size()) {
             return nullptr;
@@ -204,9 +214,6 @@ struct PacketJob {
     }
 };
 
-// ============================================================================
-// Statistics - uses atomic uint64_t, protected by atomics
-// ============================================================================
 struct DPIStats {
     std::atomic<uint64_t> total_packets{0};
     std::atomic<uint64_t> total_bytes{0};
@@ -217,7 +224,6 @@ struct DPIStats {
     std::atomic<uint64_t> other_packets{0};
     std::atomic<uint64_t> active_connections{0};
 
-    // Non-copyable due to atomics
     DPIStats() = default;
     DPIStats(const DPIStats&) = delete;
     DPIStats& operator=(const DPIStats&) = delete;

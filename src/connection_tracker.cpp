@@ -11,59 +11,58 @@ namespace DPI {
 // ============================================================================
 
 ConnectionTracker::ConnectionTracker(int fp_id, size_t max_connections)
-    : fp_id_(fp_id), max_connections_(max_connections) {
-}
+    : fp_id_(fp_id), max_connections_(max_connections) {}
 
-Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
-    // Fix (D7/E1): Always key by the canonical (direction-independent) form.
-    // Both A->B and B->A produce the same canonical key, so they share one
-    // Connection entry even when they arrive at different times.
-    FiveTuple key = tuple.canonical();
-
-    auto it = connections_.find(key);
+Connection* ConnectionTracker::getOrCreateConnection(const FlowKey& key) {
+    FlowKey canonical = key.canonical();
+    
+    auto it = connections_.find(canonical);
     if (it != connections_.end()) {
         return &it->second;
     }
 
-    // Check if we need to evict old connections
     if (connections_.size() >= max_connections_) {
         evictOldest();
     }
 
-    // Create new connection, keyed by canonical tuple
     Connection conn;
-    conn.tuple              = key;
-    conn.original_is_canonical = (tuple == key);  // true = creator was client->server
-    conn.state              = ConnectionState::NEW;
-    conn.first_seen         = std::chrono::steady_clock::now();
-    conn.last_seen          = conn.first_seen;
+    conn.flow_key = canonical;
+    conn.original_is_canonical = (key == canonical);
+    conn.state = ConnectionState::NEW;
+    conn.first_seen = std::chrono::steady_clock::now();
+    conn.last_seen = conn.first_seen;
 
-    auto result = connections_.emplace(key, std::move(conn));
+    if (!key.isIPv6()) {
+        FiveTuple t;
+        t.src_ip = std::get<IPv4Addr>(key.src_addr);
+        t.dst_ip = std::get<IPv4Addr>(key.dst_addr);
+        t.src_port = key.src_port;
+        t.dst_port = key.dst_port;
+        t.protocol = key.protocol;
+        conn.tuple = t.canonical();
+    }
+
+    auto result = connections_.emplace(canonical, std::move(conn));
     total_seen_++;
-
     return &result.first->second;
 }
 
-Connection* ConnectionTracker::getConnection(const FiveTuple& tuple) {
-    // Fix: look up by canonical — no separate reverse-lookup needed any more
-    // because getOrCreateConnection already stored by canonical key.
-    FiveTuple key = tuple.canonical();
-    auto it = connections_.find(key);
-    if (it != connections_.end()) {
-        return &it->second;
-    }
-    return nullptr;
+Connection* ConnectionTracker::getConnection(const FlowKey& key) {
+    auto it = connections_.find(key.canonical());
+    return (it != connections_.end()) ? &it->second : nullptr;
 }
 
-void ConnectionTracker::updateConnection(Connection* conn,
-                                          size_t packet_size,
-                                          bool is_client_to_server) {
+Connection* ConnectionTracker::getOrCreateConnection(const FiveTuple& tuple) {
+    return getOrCreateConnection(FlowKey::fromFiveTuple(tuple));
+}
+
+Connection* ConnectionTracker::getConnection(const FiveTuple& tuple) {
+    return getConnection(FlowKey::fromFiveTuple(tuple));
+}
+
+void ConnectionTracker::updateConnection(Connection* conn, size_t packet_size, bool is_client_to_server) {
     if (!conn) return;
-
     conn->last_seen = std::chrono::steady_clock::now();
-
-    // is_client_to_server == true  → in-bound (client sends to server)
-    // is_client_to_server == false → out-bound (server replies to client)
     if (is_client_to_server) {
         conn->packets_in++;
         conn->bytes_in += packet_size;
@@ -73,41 +72,61 @@ void ConnectionTracker::updateConnection(Connection* conn,
     }
 }
 
-void ConnectionTracker::classifyConnection(Connection* conn, AppType app, const std::string& sni) {
+void ConnectionTracker::classifyConnection(Connection* conn, AppType app, const std::string& sni, const std::string& http_host, const std::string& dns_query) {
     if (!conn) return;
     
     if (conn->state != ConnectionState::CLASSIFIED) {
         conn->app_type = app;
-        conn->sni = sni;
         conn->state = ConnectionState::CLASSIFIED;
         classified_count_++;
     }
+    
+    // Update metadata using precedence SNI > HTTP > DNS
+    if (!sni.empty()) conn->sni = sni;
+    if (!http_host.empty()) conn->http_host = http_host;
+    if (!dns_query.empty()) conn->dns_query = dns_query;
 }
 
 void ConnectionTracker::blockConnection(Connection* conn) {
     if (!conn) return;
-    
     conn->state = ConnectionState::BLOCKED;
     conn->action = PacketAction::DROP;
     blocked_count_++;
 }
 
-void ConnectionTracker::closeConnection(const FiveTuple& tuple) {
-    auto it = connections_.find(tuple);
+void ConnectionTracker::closeConnection(const FlowKey& key) {
+    auto it = connections_.find(key.canonical());
     if (it != connections_.end()) {
         it->second.state = ConnectionState::CLOSED;
     }
 }
 
-size_t ConnectionTracker::cleanupStale(std::chrono::seconds timeout) {
+void ConnectionTracker::closeConnection(const FiveTuple& tuple) {
+    closeConnection(FlowKey::fromFiveTuple(tuple));
+}
+
+size_t ConnectionTracker::cleanupStale(std::chrono::seconds default_timeout) {
     auto now = std::chrono::steady_clock::now();
     size_t removed = 0;
     
     for (auto it = connections_.begin(); it != connections_.end(); ) {
-        auto age = std::chrono::duration_cast<std::chrono::seconds>(
-            now - it->second.last_seen);
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_seen);
         
-        if (age > timeout || it->second.state == ConnectionState::CLOSED) {
+        bool should_remove = false;
+        
+        if (it->second.state == ConnectionState::CLOSED) {
+            should_remove = true;
+        } else if (it->second.flow_key.protocol == 6) { // TCP
+            if (it->second.state == ConnectionState::ESTABLISHED || it->second.state == ConnectionState::CLASSIFIED) {
+                should_remove = (age > default_timeout);
+            } else {
+                should_remove = (age > std::chrono::seconds(60)); // Half-open TCP timeout
+            }
+        } else { // UDP or ICMP
+            should_remove = (age > std::chrono::seconds(120)); // Shorter timeout for connectionless
+        }
+        
+        if (should_remove) {
             it = connections_.erase(it);
             removed++;
         } else {
@@ -121,11 +140,9 @@ size_t ConnectionTracker::cleanupStale(std::chrono::seconds timeout) {
 std::vector<Connection> ConnectionTracker::getAllConnections() const {
     std::vector<Connection> result;
     result.reserve(connections_.size());
-    
     for (const auto& pair : connections_) {
         result.push_back(pair.second);
     }
-    
     return result;
 }
 
@@ -134,12 +151,7 @@ size_t ConnectionTracker::getActiveCount() const {
 }
 
 ConnectionTracker::TrackerStats ConnectionTracker::getStats() const {
-    TrackerStats stats;
-    stats.active_connections = connections_.size();
-    stats.total_connections_seen = total_seen_;
-    stats.classified_connections = classified_count_;
-    stats.blocked_connections = blocked_count_;
-    return stats;
+    return { connections_.size(), total_seen_, classified_count_, blocked_count_ };
 }
 
 void ConnectionTracker::clear() {
@@ -154,15 +166,12 @@ void ConnectionTracker::forEach(std::function<void(const Connection&)> callback)
 
 void ConnectionTracker::evictOldest() {
     if (connections_.empty()) return;
-    
-    // Find oldest connection
     auto oldest = connections_.begin();
     for (auto it = connections_.begin(); it != connections_.end(); ++it) {
         if (it->second.last_seen < oldest->second.last_seen) {
             oldest = it;
         }
     }
-    
     connections_.erase(oldest);
 }
 
@@ -197,23 +206,19 @@ GlobalConnectionTable::GlobalStats GlobalConnectionTable::getGlobalStats() const
         stats.total_active_connections += tracker_stats.active_connections;
         stats.total_connections_seen += tracker_stats.total_connections_seen;
         
-        // Collect app distribution
         tracker->forEach([&](const Connection& conn) {
             stats.app_distribution[conn.app_type]++;
-            if (!conn.sni.empty()) {
-                domain_counts[conn.sni]++;
+            const std::string& domain = conn.bestDomain();
+            if (!domain.empty()) {
+                domain_counts[domain]++;
             }
         });
     }
     
-    // Get top domains
-    std::vector<std::pair<std::string, size_t>> domain_vec(
-        domain_counts.begin(), domain_counts.end());
-    
+    std::vector<std::pair<std::string, size_t>> domain_vec(domain_counts.begin(), domain_counts.end());
     std::sort(domain_vec.begin(), domain_vec.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
     
-    // Take top 20
     size_t count = std::min(domain_vec.size(), static_cast<size_t>(20));
     stats.top_domains.assign(domain_vec.begin(), domain_vec.begin() + count);
     
@@ -235,17 +240,11 @@ std::string GlobalConnectionTable::generateReport() const {
     ss << "║                    APPLICATION BREAKDOWN                      ║\n";
     ss << "╠══════════════════════════════════════════════════════════════╣\n";
     
-    // Calculate total for percentages
     size_t total = 0;
-    for (const auto& pair : stats.app_distribution) {
-        total += pair.second;
-    }
+    for (const auto& pair : stats.app_distribution) total += pair.second;
     
-    // Sort by count
-    std::vector<std::pair<AppType, size_t>> sorted_apps(
-        stats.app_distribution.begin(), stats.app_distribution.end());
-    std::sort(sorted_apps.begin(), sorted_apps.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::vector<std::pair<AppType, size_t>> sorted_apps(stats.app_distribution.begin(), stats.app_distribution.end());
+    std::sort(sorted_apps.begin(), sorted_apps.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
     
     for (const auto& pair : sorted_apps) {
         double pct = total > 0 ? (100.0 * pair.second / total) : 0;
@@ -261,9 +260,7 @@ std::string GlobalConnectionTable::generateReport() const {
         
         for (const auto& pair : stats.top_domains) {
             std::string domain = pair.first;
-            if (domain.length() > 35) {
-                domain = domain.substr(0, 32) + "...";
-            }
+            if (domain.length() > 35) domain = domain.substr(0, 32) + "...";
             ss << "║ " << std::setw(40) << std::left << domain
                << std::setw(10) << std::right << pair.second << "           ║\n";
         }

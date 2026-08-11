@@ -19,9 +19,18 @@ public:
     ThreadSafeQueue(size_t max_size = 10000) : max_size_(max_size) {}
     
     // Push item to queue (blocks if full)
-    void push(T item) {
+    void push(T item, std::atomic<uint64_t>* lock_ns = nullptr, std::atomic<uint64_t>* wait_ns = nullptr) {
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::unique_lock<std::mutex> lock(mutex_);
-        not_full_.wait(lock, [this] { return queue_.size() < max_size_ || shutdown_; });
+        auto t1 = std::chrono::high_resolution_clock::now();
+        if (lock_ns) lock_ns->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(), std::memory_order_relaxed);
+        
+        if (queue_.size() >= max_size_ && !shutdown_) {
+            auto tw0 = std::chrono::high_resolution_clock::now();
+            not_full_.wait(lock, [this] { return queue_.size() < max_size_ || shutdown_; });
+            auto tw1 = std::chrono::high_resolution_clock::now();
+            if (wait_ns) wait_ns->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count(), std::memory_order_relaxed);
+        }
         
         if (shutdown_) return;
         
@@ -54,11 +63,19 @@ public:
     }
     
     // Pop with timeout
-    std::optional<T> popWithTimeout(std::chrono::milliseconds timeout) {
+    std::optional<T> popWithTimeout(std::chrono::milliseconds timeout, std::atomic<uint64_t>* lock_ns = nullptr, std::atomic<uint64_t>* idle_ns = nullptr) {
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::unique_lock<std::mutex> lock(mutex_);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        if (lock_ns) lock_ns->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(), std::memory_order_relaxed);
         
-        if (!not_empty_.wait_for(lock, timeout, [this] { return !queue_.empty() || shutdown_; })) {
-            return std::nullopt;  // Timeout
+        if (queue_.empty() && !shutdown_) {
+            auto tw0 = std::chrono::high_resolution_clock::now();
+            bool acquired = not_empty_.wait_for(lock, timeout, [this] { return !queue_.empty() || shutdown_; });
+            auto tw1 = std::chrono::high_resolution_clock::now();
+            if ((!acquired || queue_.empty()) && idle_ns) {
+                idle_ns->fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count(), std::memory_order_relaxed);
+            }
         }
         
         if (queue_.empty()) return std::nullopt;

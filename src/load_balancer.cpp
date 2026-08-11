@@ -1,4 +1,5 @@
 #include "load_balancer.h"
+#include "profiler.h"
 #include <iostream>
 #include <chrono>
 
@@ -16,7 +17,7 @@ LoadBalancer::LoadBalancer(int lb_id,
       num_fps_(fp_queues.size()),
       input_queue_(10000),
       fp_queues_(std::move(fp_queues)),
-      per_fp_counts_(fp_queues.size()) {
+      per_fp_counts_(num_fps_) {
 }
 
 LoadBalancer::~LoadBalancer() {
@@ -47,21 +48,33 @@ void LoadBalancer::stop() {
 }
 
 void LoadBalancer::run() {
-    while (running_) {
+    while (true) {
         // Get packet from input queue (with timeout to check running flag)
-        auto job_opt = input_queue_.popWithTimeout(std::chrono::milliseconds(100));
+        auto job_opt = input_queue_.popWithTimeout(
+            std::chrono::milliseconds(100),
+            &Profiler::instance().lb_pop_lock_ns,
+            &Profiler::instance().lb_idle_ns
+        );
         
         if (!job_opt) {
-            continue;  // Timeout or shutdown
+            if (!running_ && input_queue_.empty()) break;
+            continue;  // Timeout
         }
         
         packets_received_++;
+        Profiler::instance().lb_packets++;
         
-        // Select target FP based on five-tuple hash
-        int fp_index = selectFP(job_opt->tuple);
+        int fp_index = 0;
+        {
+            ScopedNsTimer t(Profiler::instance().lb_select_fp_ns);
+            fp_index = selectFP(job_opt->tuple);
+        }
         
-        // Push to selected FP's queue
-        fp_queues_[fp_index]->push(std::move(*job_opt));
+        fp_queues_[fp_index]->push(
+            std::move(*job_opt),
+            nullptr,
+            &Profiler::instance().lb_push_wait_ns
+        );
         
         packets_dispatched_++;
         per_fp_counts_[fp_index]++;

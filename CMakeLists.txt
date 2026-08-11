@@ -37,11 +37,14 @@ set(DPI_LIB_SOURCES
     src/packet_parser.cpp
     src/types.cpp
     src/sni_extractor.cpp
+    src/tcp_reassembler.cpp
     src/connection_tracker.cpp
     src/rule_manager.cpp
     src/fast_path.cpp
     src/load_balancer.cpp
     src/dpi_engine.cpp
+    src/profiler.cpp
+    src/parser_pool.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -62,6 +65,16 @@ add_executable(dpi_engine
 target_link_libraries(dpi_engine PRIVATE Threads::Threads)
 
 # ---------------------------------------------------------------------------
+# Benchmark executable: dpi_benchmark
+# ---------------------------------------------------------------------------
+add_executable(dpi_benchmark
+    tests/benchmark.cpp
+    ${DPI_LIB_SOURCES}
+)
+
+target_link_libraries(dpi_benchmark PRIVATE Threads::Threads)
+
+# ---------------------------------------------------------------------------
 # Test executable: dpi_tests
 #
 # Uses the same library sources, but a separate main in tests/.
@@ -80,13 +93,30 @@ add_test(NAME correctness COMMAND dpi_tests)
 
 # ---------------------------------------------------------------------------
 # Optional sanitizer build
-# Enable with:  cmake -DENABLE_ASAN=ON ..
+# Enable with:  cmake -DENABLE_ASAN=ON -DENABLE_UBSAN=ON ..
 # ---------------------------------------------------------------------------
 option(ENABLE_ASAN "Build with AddressSanitizer" OFF)
+option(ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
+option(ENABLE_TSAN "Build with ThreadSanitizer" OFF)
+
+set(SANITIZERS "")
 if(ENABLE_ASAN AND NOT MSVC)
-    target_compile_options(dpi_engine  PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(dpi_engine     PRIVATE -fsanitize=address,undefined)
-    target_compile_options(dpi_tests   PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-    target_link_options(dpi_tests      PRIVATE -fsanitize=address,undefined)
-    message(STATUS "AddressSanitizer + UBSan enabled")
+    list(APPEND SANITIZERS "address")
+endif()
+if(ENABLE_UBSAN AND NOT MSVC)
+    list(APPEND SANITIZERS "undefined")
+endif()
+if(ENABLE_TSAN AND NOT MSVC)
+    list(APPEND SANITIZERS "thread")
+endif()
+
+if(SANITIZERS)
+    list(JOIN SANITIZERS "," SANITIZER_LIST)
+    target_compile_options(dpi_engine    PRIVATE -fsanitize=${SANITIZER_LIST} -fno-omit-frame-pointer)
+    target_link_options(dpi_engine       PRIVATE -fsanitize=${SANITIZER_LIST})
+    target_compile_options(dpi_tests     PRIVATE -fsanitize=${SANITIZER_LIST} -fno-omit-frame-pointer)
+    target_link_options(dpi_tests        PRIVATE -fsanitize=${SANITIZER_LIST})
+    target_compile_options(dpi_benchmark PRIVATE -fsanitize=${SANITIZER_LIST} -fno-omit-frame-pointer)
+    target_link_options(dpi_benchmark PRIVATE -fsanitize=${SANITIZER_LIST})
+    message(STATUS "Sanitizers enabled: ${SANITIZER_LIST}")
 endif()

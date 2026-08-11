@@ -1,5 +1,6 @@
 #include "dpi_engine.h"
 #include "net_utils.h"
+#include "profiler.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -13,7 +14,7 @@ namespace DPI {
 // ============================================================================
 
 DPIEngine::DPIEngine(const Config& config)
-    : config_(config), output_queue_(10000) {
+    : config_(config), raw_packet_queue_(config.queue_size), output_queue_(config.queue_size) {
     
     std::cout << "\n";
     std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
@@ -21,6 +22,7 @@ DPIEngine::DPIEngine(const Config& config)
     std::cout << "║               Deep Packet Inspection System                   ║\n";
     std::cout << "╠══════════════════════════════════════════════════════════════╣\n";
     std::cout << "║ Configuration:                                                ║\n";
+    std::cout << "║   Parser Workers:    " << std::setw(3) << config.num_parser_workers << "                                       ║\n";
     std::cout << "║   Load Balancers:    " << std::setw(3) << config.num_load_balancers << "                                       ║\n";
     std::cout << "║   FPs per LB:        " << std::setw(3) << config.fps_per_lb << "                                       ║\n";
     std::cout << "║   Total FP threads:  " << std::setw(3) << (config.num_load_balancers * config.fps_per_lb) << "                                       ║\n";
@@ -55,6 +57,16 @@ bool DPIEngine::initialize() {
         config_.fps_per_lb,
         fp_manager_->getQueuePtrs()
     );
+
+    // Create Parser manager (connects raw queue to LB selector)
+    auto lb_selector = [this](const FiveTuple& tuple) -> LoadBalancer& {
+        return lb_manager_->getLBForPacket(tuple);
+    };
+    parser_manager_ = std::make_unique<ParserManager>(
+        config_.num_parser_workers,
+        raw_packet_queue_,
+        lb_selector
+    );
     
     // Create global connection table
     global_conn_table_ = std::make_unique<GlobalConnectionTable>(total_fps);
@@ -80,6 +92,9 @@ void DPIEngine::start() {
     
     // Start LB threads
     lb_manager_->startAll();
+
+    // Start Parser threads
+    parser_manager_->startAll();
     
     std::cout << "[DPIEngine] All threads started\n";
 }
@@ -88,17 +103,26 @@ void DPIEngine::stop() {
     if (!running_) return;
     
     running_ = false;
+
+    std::cout << "[DPIEngine] Stopping Parsers..." << std::endl;
+    raw_packet_queue_.shutdown();
+    if (parser_manager_) {
+        parser_manager_->stopAll();
+    }
     
+    std::cout << "[DPIEngine] Stopping LBs..." << std::endl;
     // Stop LB threads first (they feed FPs)
     if (lb_manager_) {
         lb_manager_->stopAll();
     }
     
+    std::cout << "[DPIEngine] Stopping FPs..." << std::endl;
     // Stop FP threads
     if (fp_manager_) {
         fp_manager_->stopAll();
     }
     
+    std::cout << "[DPIEngine] Stopping Output Queue..." << std::endl;
     // Stop output thread
     output_queue_.shutdown();
     if (output_thread_.joinable()) {
@@ -109,13 +133,16 @@ void DPIEngine::stop() {
 }
 
 void DPIEngine::waitForCompletion() {
-    // Wait for reader to finish
+    // Wait for reader to finish pushing raw packets
     if (reader_thread_.joinable()) {
         reader_thread_.join();
     }
     
-    // Wait a bit for queues to drain
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Once reader finishes, shutdown raw_packet_queue_ so parser workers finish remaining jobs and exit
+    raw_packet_queue_.shutdown();
+    if (parser_manager_) {
+        parser_manager_->stopAll();
+    }
     
     // Signal completion
     processing_complete_ = true;
@@ -147,13 +174,10 @@ bool DPIEngine::processFile(const std::string& input_file,
     // Start reader thread
     reader_thread_ = std::thread(&DPIEngine::readerThreadFunc, this, input_file);
     
-    // Wait for completion
+    // Wait for reader to finish
     waitForCompletion();
     
-    // Give some time for final packets to process
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    
-    // Stop all threads
+    // Stop all threads - this will block until all LBs and FPs drain their queues gracefully
     stop();
     
     // Close output file
@@ -164,6 +188,69 @@ bool DPIEngine::processFile(const std::string& input_file,
     // Print final report
     std::cout << generateReport();
     std::cout << fp_manager_->generateClassificationReport();
+    
+    return true;
+}
+
+bool DPIEngine::processSynthetic(int num_packets) {
+    std::vector<uint8_t> base_data = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0x08, 0x00,
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00,
+        0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x00, 0x02,
+        0x04, 0xd2, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    
+    std::vector<RawPacketJob> dataset;
+    dataset.reserve(num_packets);
+    for (int i = 0; i < num_packets; i++) {
+        RawPacketJob raw_job;
+        raw_job.packet_id = i;
+        raw_job.ts_sec = 0;
+        raw_job.ts_usec = i;
+        raw_job.data = base_data;
+        raw_job.data[34 + 7] = static_cast<uint8_t>(i % 256);
+        raw_job.data[29] = (i % 100) + 1;
+        dataset.push_back(std::move(raw_job));
+    }
+    
+    return processSynthetic(dataset);
+}
+
+bool DPIEngine::processSynthetic(const std::vector<RawPacketJob>& dataset) {
+    if (!rule_manager_) {
+        if (!initialize()) {
+            return false;
+        }
+    }
+    
+    Profiler::instance().reset();
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    start();
+    
+    reader_thread_ = std::thread([this, &dataset]() {
+        for (size_t i = 0; i < dataset.size(); i++) {
+            RawPacketJob raw_job = dataset[i];
+            {
+                ScopedNsTimer t(Profiler::instance().reader_gen_raw_ns);
+                // raw_job copy timing measured
+            }
+            
+            raw_packet_queue_.push(
+                std::move(raw_job),
+                nullptr,
+                &Profiler::instance().reader_push_wait_ns
+            );
+        }
+    });
+    
+    waitForCompletion();
+    stop();
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    uint64_t total_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    Profiler::instance().total_wall_time_ns.store(total_ns);
     
     return true;
 }
@@ -180,38 +267,22 @@ void DPIEngine::readerThreadFunc(const std::string& input_file) {
     writeOutputHeader(reader.getGlobalHeader());
     
     PacketAnalyzer::RawPacket raw;
-    PacketAnalyzer::ParsedPacket parsed;
     uint32_t packet_id = 0;
     
     std::cout << "[Reader] Starting packet processing...\n";
     
     while (reader.readNextPacket(raw)) {
-        // Parse the packet
-        if (!PacketAnalyzer::PacketParser::parse(raw, parsed)) {
-            continue;  // Skip unparseable packets
-        }
-        
-        // Only process IP packets with TCP/UDP
-        if (!parsed.has_ip || (!parsed.has_tcp && !parsed.has_udp)) {
-            continue;
-        }
-        
-        // Create packet job
-        PacketJob job = createPacketJob(raw, parsed, packet_id++);
+        RawPacketJob raw_job;
+        raw_job.packet_id = packet_id++;
+        raw_job.ts_sec = raw.header.ts_sec;
+        raw_job.ts_usec = raw.header.ts_usec;
+        raw_job.data = std::move(raw.data);
         
         // Update global stats
         stats_.total_packets++;
-        stats_.total_bytes += raw.data.size();
+        stats_.total_bytes += raw_job.data.size();
         
-        if (parsed.has_tcp) {
-            stats_.tcp_packets++;
-        } else if (parsed.has_udp) {
-            stats_.udp_packets++;
-        }
-        
-        // Send to appropriate LB based on hash
-        LoadBalancer& lb = lb_manager_->getLBForPacket(job.tuple);
-        lb.getInputQueue().push(std::move(job));
+        raw_packet_queue_.push(std::move(raw_job));
     }
     
     std::cout << "[Reader] Finished reading " << packet_id << " packets\n";
@@ -235,8 +306,17 @@ PacketJob DPIEngine::createPacketJob(const PacketAnalyzer::RawPacket& raw,
     job.tuple.dst_port = parsed.dest_port;
     job.tuple.protocol = parsed.protocol;
 
-    // TCP flags
+    if (parsed.has_ipv6) {
+        job.flow_key = FlowKey::fromIPv6(parsed.src_ipv6, parsed.dst_ipv6, parsed.src_port, parsed.dest_port, parsed.protocol);
+        job.has_flow_key = true;
+    } else if (parsed.has_ip) {
+        job.flow_key = FlowKey::fromFiveTuple(job.tuple);
+        job.has_flow_key = true;
+    }
+
+    // TCP flags and sequence number
     job.tcp_flags = parsed.tcp_flags;
+    job.tcp_seq_number = parsed.seq_number;
 
     // Copy packet data
     job.data = raw.data;
@@ -272,10 +352,16 @@ PacketJob DPIEngine::createPacketJob(const PacketAnalyzer::RawPacket& raw,
 
 void DPIEngine::outputThreadFunc() {
     while (running_ || !output_queue_.empty()) {
-        auto job_opt = output_queue_.popWithTimeout(std::chrono::milliseconds(100));
+        auto job_opt = output_queue_.popWithTimeout(
+            std::chrono::milliseconds(100),
+            &Profiler::instance().output_pop_lock_ns,
+            &Profiler::instance().output_idle_ns
+        );
         
         if (job_opt) {
+            ScopedNsTimer t(Profiler::instance().output_write_ns);
             writeOutputPacket(*job_opt);
+            Profiler::instance().output_packets++;
         }
     }
 }
@@ -287,7 +373,9 @@ void DPIEngine::handleOutput(const PacketJob& job, PacketAction action) {
     }
     
     stats_.forwarded_packets++;
-    output_queue_.push(job);
+    if (output_file_.is_open()) {
+        output_queue_.push(job);
+    }
 }
 
 bool DPIEngine::writeOutputHeader(const PacketAnalyzer::PcapGlobalHeader& header) {
